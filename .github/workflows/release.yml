@@ -6,8 +6,9 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Tag to build and publish"
+        description: "Tag to create and publish"
         required: true
+        default: "v1.0.0"
 
 permissions:
   contents: write
@@ -26,9 +27,10 @@ jobs:
       KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
 
     steps:
+      # No explicit ref: a tag push checks out the tag, a manual dispatch checks out the
+      # branch it was dispatched on. The release step below then creates the tag at that
+      # commit, so a release can be cut without push access to refs/tags.
       - uses: actions/checkout@v4
-        with:
-          ref: ${{ github.event.inputs.tag || github.ref }}
 
       - uses: actions/setup-java@v4
         with:
@@ -75,6 +77,8 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          target_commitish: ${{ github.sha }}
+          name: NeuroForge ${{ github.event.inputs.tag || github.ref_name }}
           body_path: CHANGELOG.md
           files: dist/*.apk
           fail_on_unmatched_files: true
