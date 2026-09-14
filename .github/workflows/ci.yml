@@ -45,7 +45,18 @@ jobs:
           distribution: temurin
           java-version: "17"
 
-      - uses: android-actions/setup-android@v3
+      # The runner image already ships the Android SDK, so it only needs the right platform
+      # installed. Done directly rather than through android-actions/setup-android, which
+      # installs the legacy `tools` package that Google has removed from the SDK repository
+      # - that action fails outright on current cmdline-tools.
+      - name: Install Android SDK packages
+        run: |
+          set -euo pipefail
+          SDK="${ANDROID_HOME:-$ANDROID_SDK_ROOT}"
+          SDKMANAGER="$(find "$SDK/cmdline-tools" -name sdkmanager -type f | head -1)"
+          echo "using $SDKMANAGER"
+          yes | "$SDKMANAGER" --licenses > /dev/null 2>&1 || true
+          "$SDKMANAGER" "platforms;android-36" "build-tools;36.0.0"
 
       - uses: gradle/actions/setup-gradle@v4
 
