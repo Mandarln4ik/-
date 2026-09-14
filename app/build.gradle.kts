@@ -15,17 +15,33 @@ android {
     minSdk = 31
     targetSdk = 36
     versionCode = 1
-    versionName = "1.0"
+    versionName = "1.0.0"
 
     // The NPU accelerators ship arm64 only; shipping other ABIs would only grow the APK
     // with builds that can never reach the hardware this app exists for.
     ndk { abiFilters.add("arm64-v8a") }
   }
 
+  // Release signing is opt-in via environment variables, so CI can sign when the repository
+  // has the secrets and everyone else can still build. A missing keystore leaves the release
+  // APK unsigned rather than failing the build or silently substituting the debug key.
+  val keystorePath: String? = System.getenv("KEYSTORE_PATH")?.takeIf { it.isNotBlank() }
+  signingConfigs {
+    if (keystorePath != null) {
+      create("release") {
+        storeFile = file(keystorePath)
+        storePassword = System.getenv("KEYSTORE_PASSWORD")
+        keyAlias = System.getenv("KEY_ALIAS")
+        keyPassword = System.getenv("KEY_PASSWORD")
+      }
+    }
+  }
+
   buildTypes {
     release {
       isMinifyEnabled = true
       proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
+      signingConfig = signingConfigs.findByName("release")
     }
     debug {
       isMinifyEnabled = false

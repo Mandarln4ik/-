@@ -1,0 +1,80 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to build and publish"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build and publish
+    runs-on: ubuntu-latest
+
+    # Secrets are lifted into the job environment because the `secrets` context is not
+    # available in a step's `if:` - testing `env.` is the pattern that actually works.
+    env:
+      KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+      KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+      KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+      KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: android-actions/setup-android@v3
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      # Gate the release on the tests. A tag that ships broken sampler maths is worse than
+      # a tag that fails to publish.
+      - name: Run core unit tests
+        working-directory: core
+        run: ./gradlew test --no-daemon
+
+      # Signing is optional. With the secrets present the release APK is signed and
+      # upgradable in place; without them it still builds, and the notes say it is unsigned
+      # rather than shipping something that looks installable and is not.
+      - name: Decode keystore
+        id: keystore
+        if: env.KEYSTORE_BASE64 != ''
+        run: |
+          echo "$KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/release.jks"
+          echo "path=$RUNNER_TEMP/release.jks" >> "$GITHUB_OUTPUT"
+
+      - name: Assemble release
+        env:
+          KEYSTORE_PATH: ${{ steps.keystore.outputs.path }}
+        run: ./gradlew :app:assembleRelease --no-daemon
+
+      # Debug-signed as well: it installs with `adb install` straight away, which is what
+      # anyone testing NPU support on their own phone actually needs.
+      - name: Assemble debug
+        run: ./gradlew :app:assembleDebug --no-daemon
+
+      - name: Collect artifacts
+        run: |
+          mkdir -p dist
+          find app/build/outputs/apk -name '*.apk' -exec cp {} dist/ \;
+          ls -lh dist
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          body_path: CHANGELOG.md
+          files: dist/*.apk
+          fail_on_unmatched_files: true
