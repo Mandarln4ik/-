@@ -7,6 +7,7 @@ import androidx.lifecycle.viewModelScope
 import androidx.lifecycle.viewmodel.initializer
 import androidx.lifecycle.viewmodel.viewModelFactory
 import dev.neuroforge.NeuroForgeApp
+import dev.neuroforge.core.AcceleratorPolicy
 import dev.neuroforge.core.BenchmarkReport
 import dev.neuroforge.core.ModelCatalog
 import dev.neuroforge.core.ModelSpec
@@ -56,6 +57,15 @@ class AppViewModel(private val app: NeuroForgeApp) : ViewModel() {
   val steps = MutableStateFlow(4)
   val target = MutableStateFlow(OutputTarget.SQUARE_4K)
   val strategy = MutableStateFlow(UpscaleStrategy.FAST)
+
+  /**
+   * Which accelerators a run may use.
+   *
+   * Persisted because it is a deliberate choice about how the app behaves, not a per-run
+   * knob: someone who set "NPU only" to find out whether their APU works wants that answer
+   * to survive the app being killed mid-download.
+   */
+  val policy = MutableStateFlow(loadPolicy())
 
   private var generationJob: Job? = null
   private val downloadJobs = mutableMapOf<String, Job>()
@@ -135,7 +145,7 @@ class AppViewModel(private val app: NeuroForgeApp) : ViewModel() {
    */
   fun runBenchmark() {
     if (_state.value.benchmarkRunning) return
-    val spec = ModelCatalog.MOBILENET_V2_INT8
+    val spec = ModelCatalog.BENCHMARK_MOBILENET
     val file = app.repository.fileFor(spec, spec.files.first())
     if (!file.isFile) {
       _state.update { it.copy(error = "Download the benchmark model first (${spec.displayName}).") }
@@ -167,6 +177,7 @@ class AppViewModel(private val app: NeuroForgeApp) : ViewModel() {
             steps = steps.value,
             target = target.value,
             strategy = strategy.value,
+            policy = policy.value,
           )
         ) { progress -> _state.update { it.copy(generation = progress) } }
         _state.update { it.copy(result = result, generation = null) }
@@ -184,6 +195,20 @@ class AppViewModel(private val app: NeuroForgeApp) : ViewModel() {
   fun dismissError() = _state.update { it.copy(error = null) }
 
   fun randomizeSeed() { seed.value = (Math.random() * Long.MAX_VALUE).toLong() }
+
+  fun setPolicy(next: AcceleratorPolicy) {
+    policy.value = next
+    prefs.edit().putString(KEY_POLICY, next.name).apply()
+  }
+
+  private fun loadPolicy(): AcceleratorPolicy {
+    val stored = prefs.getString(KEY_POLICY, null) ?: return AcceleratorPolicy.AUTO
+    // A stored name can outlive the enum constant it referred to across an update, so an
+    // unknown value falls back rather than crashing on launch.
+    return AcceleratorPolicy.entries.firstOrNull { it.name == stored } ?: AcceleratorPolicy.AUTO
+  }
+
+  private val prefs by lazy { app.getSharedPreferences("neuroforge", android.content.Context.MODE_PRIVATE) }
 
   /** Writes the result as a lossless PNG; a 4K render is not something to re-encode as JPEG. */
   fun saveResult(bitmap: Bitmap) {
@@ -203,6 +228,8 @@ class AppViewModel(private val app: NeuroForgeApp) : ViewModel() {
 
 
   companion object {
+    private const val KEY_POLICY = "accelerator_policy"
+
     fun factory(app: NeuroForgeApp) = viewModelFactory {
       initializer { AppViewModel(app) }
     }

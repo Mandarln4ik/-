@@ -44,6 +44,7 @@ fun ModelsScreen(vm: AppViewModel, state: UiState) {
         InfoRow("Role", spec.role.name)
         InfoRow("Size", formatBytes(spec.totalBytes))
         InfoRow("Targets", spec.accelerators.joinToString(" → "))
+        InfoRow("Source", spec.files.first().originLabel())
         if (spec.notes.isNotEmpty()) {
           Text(
             spec.notes,
@@ -55,12 +56,8 @@ fun ModelsScreen(vm: AppViewModel, state: UiState) {
 
         files.forEach { (name, fileState) ->
           val description = when (fileState) {
-            is ModelState.Ready ->
-              "ready (${formatBytes(fileState.bytes)}" +
-                (if (fileState.checksumVerified) ", verified)" else ")")
+            is ModelState.Ready -> "ready (${formatBytes(fileState.bytes)})"
             is ModelState.Absent -> "not downloaded"
-            is ModelState.Partial ->
-              "partial — ${formatBytes(fileState.bytes)} of ${formatBytes(fileState.total)}"
             is ModelState.Corrupt -> "problem: ${fileState.reason}"
             is ModelState.NeedsConversion -> "needs conversion — ${fileState.recipe}"
           }

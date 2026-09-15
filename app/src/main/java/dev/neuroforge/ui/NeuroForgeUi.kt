@@ -7,6 +7,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Memory
 import androidx.compose.material.icons.filled.AutoAwesome
 import androidx.compose.material.icons.filled.Download
+import androidx.compose.material.icons.filled.Tune
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.NavigationBar
@@ -31,6 +32,7 @@ private enum class Tab(val label: String, val icon: ImageVector) {
   GENERATE("Generate", Icons.Filled.AutoAwesome),
   DEVICE("Device", Icons.Filled.Memory),
   MODELS("Models", Icons.Filled.Download),
+  SETTINGS("Settings", Icons.Filled.Tune),
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -84,6 +86,7 @@ fun NeuroForgeUi(vm: AppViewModel) {
         Tab.GENERATE -> GenerateScreen(vm, state)
         Tab.DEVICE -> DeviceScreen(vm, state)
         Tab.MODELS -> ModelsScreen(vm, state)
+        Tab.SETTINGS -> SettingsScreen(vm, state)
       }
     }
   }

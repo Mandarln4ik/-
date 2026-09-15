@@ -5,6 +5,7 @@ import android.graphics.Bitmap
 import android.os.SystemClock
 import android.util.Log
 import dev.neuroforge.core.Accel
+import dev.neuroforge.core.AcceleratorPolicy
 import dev.neuroforge.core.FlowMatchEulerScheduler
 import dev.neuroforge.core.LatentPacking
 import dev.neuroforge.core.LatentSpec
@@ -37,6 +38,7 @@ data class GenerationRequest(
   val target: OutputTarget = OutputTarget.SQUARE_4K,
   val strategy: UpscaleStrategy = UpscaleStrategy.FAST,
   val upscale: Boolean = true,
+  val policy: AcceleratorPolicy = AcceleratorPolicy.AUTO,
 )
 
 /** Where the run currently is. */
@@ -139,7 +141,7 @@ class GenerationPipeline(
 
     // ---- 1. Text ---------------------------------------------------------------------
     report(GenerationStage.LoadingTextEncoder, 0f, "Loading text encoder (1.7 GiB)")
-    val embeddings = stage(ModelCatalog.BONSAI_TEXT_ENCODER, timings, "text encoder") { session ->
+    val embeddings = stage(ModelCatalog.BONSAI_TEXT_ENCODER, timings, "text encoder", request.policy) { session ->
       coroutineContext.ensureActive()
       report(GenerationStage.Encoding, 0.05f, "Encoding prompt on ${session.accelerator}")
       val ids = PromptTokenizer.forModel(context, repository, ModelCatalog.BONSAI_TEXT_ENCODER)
@@ -161,7 +163,7 @@ class GenerationPipeline(
     for (i in latent.indices) latent[i] *= scheduler.initialNoiseScale
     val rng = Pcg32(request.seed xor SAMPLER_STREAM)
 
-    stage(ModelCatalog.BONSAI_DIT, timings, "diffusion transformer") { session ->
+    stage(ModelCatalog.BONSAI_DIT, timings, "diffusion transformer", request.policy) { session ->
       check(session.inputCount >= 3) {
         "the diffusion graph declares ${session.inputCount} inputs; this pipeline feeds " +
           "(packed latent, prompt embeddings, timestep) and needs at least 3"
@@ -191,7 +193,7 @@ class GenerationPipeline(
 
     // ---- 3. Decode -------------------------------------------------------------------
     report(GenerationStage.Decoding, 0.62f, "Decoding latent")
-    val baseImage = stage(ModelCatalog.BONSAI_VAE, timings, "VAE decoder") { session ->
+    val baseImage = stage(ModelCatalog.BONSAI_VAE, timings, "VAE decoder", request.policy) { session ->
       session.writeInput(0, latent)
       session.run()
       val pixels = asHwc(
@@ -206,11 +208,17 @@ class GenerationPipeline(
     }
 
     // ---- 4. Upscale to 4K ------------------------------------------------------------
+    val upscaler = ModelCatalog.UPSCALER_ESRGAN_X4
     val plan = RenderPlan.of(
       baseWidth = baseImage.width,
       baseHeight = baseImage.height,
       target = request.target,
       strategy = request.strategy,
+      // Geometry comes from the graph that will actually run, not from a default: this
+      // upscaler takes 128px tiles and emits x4, and a mismatch here would only surface
+      // as a shape error on the first tile.
+      networkScale = upscaler.scale,
+      tileSize = upscaler.tileSize ?: 256,
     )
     Log.i(TAG, plan.describe())
 
@@ -220,14 +228,14 @@ class GenerationPipeline(
       return@withContext GenerationResult(fitted, request, plan, timings)
     }
 
-    requireReady(ModelCatalog.REAL_ESRGAN_X4)
+    requireReady(upscaler)
     var current = baseImage
-    stage(ModelCatalog.REAL_ESRGAN_X4, timings, "upscaler") { session ->
-      val upscaler = TiledUpscaler(session)
+    stage(upscaler, timings, "upscaler", request.policy) { session ->
+      val tiled = TiledUpscaler(session, Normalization.of(upscaler.inputRange))
       plan.passes.forEach { pass ->
         coroutineContext.ensureActive()
         current = ImageTensor.resample(current, pass.inputWidth, pass.inputHeight)
-        current = upscaler.upscale(current, pass.grid, pass.index) { p ->
+        current = tiled.upscale(current, pass.grid, pass.index) { p ->
           report(
             GenerationStage.Upscaling(pass.index + 1, plan.passes.size, p.tilesDone, p.tilesTotal),
             0.65f + 0.33f * ((pass.index + p.fraction) / plan.passes.size),
@@ -254,11 +262,18 @@ class GenerationPipeline(
     spec: ModelSpec,
     timings: MutableList<StageTiming>,
     label: String,
+    policy: AcceleratorPolicy = AcceleratorPolicy.AUTO,
     block: (LiteRtSession) -> T,
   ): T {
     val file = repository.fileFor(spec, spec.files.first())
+    val targets = policy.resolveFor(spec)
+    check(targets.isNotEmpty()) {
+      "$label supports ${spec.accelerators.joinToString("/")}, which the " +
+        "'${policy.label}' policy excludes. Change the policy in Settings."
+    }
     val t0 = SystemClock.elapsedRealtime()
-    return LiteRtSession.load(context, spec.displayName, file, spec.accelerators).use { session ->
+    return LiteRtSession.load(context, spec.displayName, file, targets, policy.strict)
+      .use { session ->
       val result = block(session)
       timings += StageTiming(label, session.accelerator, SystemClock.elapsedRealtime() - t0)
       result

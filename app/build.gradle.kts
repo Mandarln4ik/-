@@ -14,8 +14,8 @@ android {
     // 31 is where Build.SOC_MODEL arrives, and it is the floor the LiteRT NPU samples use.
     minSdk = 31
     targetSdk = 36
-    versionCode = 1
-    versionName = "1.0.0"
+    versionCode = 2
+    versionName = "1.1.0"
 
     // The NPU accelerators ship arm64 only; shipping other ABIs would only grow the APK
     // with builds that can never reach the hardware this app exists for.
@@ -92,7 +92,6 @@ dependencies {
   implementation(libs.androidx.ui.tooling.preview)
   implementation(libs.androidx.material3)
   implementation(libs.androidx.material.icons.extended)
-  implementation(libs.androidx.datastore.preferences)
 
   implementation(libs.kotlinx.coroutines.android)
   implementation(libs.kotlinx.serialization.json)

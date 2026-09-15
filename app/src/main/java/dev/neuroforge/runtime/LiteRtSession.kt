@@ -75,6 +75,36 @@ class LiteRtSession private constructor(
     inputs[index].writeFloat(data)
   }
 
+  /** Remembers, per input, whether the graph turned out to want int8 rather than float. */
+  private val int8Input = BooleanArray(inputs.size)
+
+  /**
+   * Writes [data] into input [index], falling back to int8 when the graph declares an
+   * integer input tensor.
+   *
+   * A fully integer-quantised graph exposes int8 input tensors, and `writeFloat` on one is
+   * a type error rather than an implicit conversion. Rather than guess from the file name,
+   * this tries float once and remembers the answer.
+   *
+   * The int8 path writes the raw bytes without applying the tensor's quantisation scale and
+   * zero point, so it is only correct where the *values* do not matter — the latency
+   * benchmark. Anything whose output is looked at must use [writeInput] on a float graph;
+   * every such model in this app has float I/O, which was checked by running them.
+   */
+  fun writeInputForTiming(index: Int, data: FloatArray) {
+    if (!int8Input[index]) {
+      try {
+        inputs[index].writeFloat(data)
+        return
+      } catch (t: Throwable) {
+        Log.i(TAG, "$label input $index is not float (${t.javaClass.simpleName}); using int8")
+        int8Input[index] = true
+      }
+    }
+    val bytes = ByteArray(data.size) { i -> (data[i] * 255f - 128f).toInt().toByte() }
+    inputs[index].writeInt8(bytes)
+  }
+
   /** Writes integer data into input tensor [index] — token ids, timestep indices. */
   fun writeInput(index: Int, data: IntArray) {
     inputs[index].writeInt(data)
@@ -118,8 +148,13 @@ class LiteRtSession private constructor(
       label: String,
       modelFile: File,
       preference: List<Accel>,
+      strict: Boolean = false,
     ): LiteRtSession {
       require(modelFile.isFile) { "model file missing: ${modelFile.absolutePath}" }
+      require(preference.isNotEmpty()) {
+        "no accelerator is allowed for '$label' under the current policy. The chosen policy " +
+          "excludes every target this model supports - pick a different policy or model."
+      }
       val env = LiteRt.environment(context)
       val attempts = mutableListOf<LoadAttempt>()
 
@@ -146,7 +181,17 @@ class LiteRtSession private constructor(
         )
       }
 
-      // Last resort: let LiteRT mix accelerators across the graph. Slower to reason about,
+      // In strict mode there is no safety net: the whole point of asking for one specific
+      // accelerator is to learn whether it can take the graph, and a silent mixed-delegation
+      // fallback would answer that question with a comfortable lie.
+      if (strict) {
+        throw IllegalStateException(
+          "'$label' could not run on ${preference.joinToString("/")}: " +
+            attempts.joinToString("; ") { "${it.accelerator}=${it.error}" }
+        )
+      }
+
+      // Otherwise let LiteRT mix accelerators across the graph. Harder to reason about,
       // but a running model beats a clean failure report.
       val t0 = SystemClock.elapsedRealtime()
       val mixed = runCatching {
