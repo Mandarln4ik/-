@@ -35,6 +35,19 @@ enum class AcceleratorPolicy(val label: String, val order: List<Accel>, val stri
       else -> spec.accelerators
     }
   }
+
+  companion object {
+    /**
+     * Restores a policy from whatever was persisted, falling back to [AUTO].
+     *
+     * A stored name can outlive the constant it referred to — a rename between app
+     * versions leaves an unreadable string in preferences, and the app must not fail to
+     * start over one. Pure and unit-tested because it runs during construction, where a
+     * defect shows up as a launch crash rather than a bad reading.
+     */
+    fun fromStoredName(name: String?): AcceleratorPolicy =
+      entries.firstOrNull { it.name == name } ?: AUTO
+  }
 }
 
 /** How pixel values map onto the tensor values a graph expects. */
