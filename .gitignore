@@ -1,0 +1,21 @@
+# Build output
+build/
+.gradle/
+*.apk
+*.aab
+
+# Local SDK location, per-machine
+local.properties
+
+# IDE
+.idea/
+*.iml
+.kotlin/
+
+# Downloaded model weights - gigabytes, never committed
+*.tflite
+*.pth
+*.onnx
+
+# Vendor NPU runtimes are not redistributable; see docs/NPU_RUNTIME.md
+app/src/main/jniLibs/arm64-v8a/*.so
