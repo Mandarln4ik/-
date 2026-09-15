@@ -198,17 +198,25 @@ class AppViewModel(private val app: NeuroForgeApp) : ViewModel() {
 
   fun setPolicy(next: AcceleratorPolicy) {
     policy.value = next
-    prefs.edit().putString(KEY_POLICY, next.name).apply()
+    prefs().edit().putString(KEY_POLICY, next.name).apply()
   }
 
-  private fun loadPolicy(): AcceleratorPolicy {
-    val stored = prefs.getString(KEY_POLICY, null) ?: return AcceleratorPolicy.AUTO
-    // A stored name can outlive the enum constant it referred to across an update, so an
-    // unknown value falls back rather than crashing on launch.
-    return AcceleratorPolicy.entries.firstOrNull { it.name == stored } ?: AcceleratorPolicy.AUTO
-  }
+  /**
+   * Resolved on each call rather than held in a field.
+   *
+   * A property initialiser that reads another property only works if the other one is
+   * declared above it — and [policy] is initialised from [loadPolicy], so a field here
+   * silently depended on declaration order. It did not survive contact: moving the field
+   * below `policy` left its delegate null and crashed the app on launch. The framework
+   * caches SharedPreferences instances, so calling for it is cheap and the ordering
+   * hazard simply stops existing.
+   */
+  private fun prefs(): android.content.SharedPreferences =
+    app.getSharedPreferences(PREFS_NAME, android.content.Context.MODE_PRIVATE)
 
-  private val prefs by lazy { app.getSharedPreferences("neuroforge", android.content.Context.MODE_PRIVATE) }
+  private fun loadPolicy(): AcceleratorPolicy =
+    AcceleratorPolicy.fromStoredName(prefs().getString(KEY_POLICY, null))
+
 
   /** Writes the result as a lossless PNG; a 4K render is not something to re-encode as JPEG. */
   fun saveResult(bitmap: Bitmap) {
@@ -228,6 +236,7 @@ class AppViewModel(private val app: NeuroForgeApp) : ViewModel() {
 
 
   companion object {
+    private const val PREFS_NAME = "neuroforge"
     private const val KEY_POLICY = "accelerator_policy"
 
     fun factory(app: NeuroForgeApp) = viewModelFactory {

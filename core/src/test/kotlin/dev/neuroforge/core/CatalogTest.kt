@@ -131,6 +131,22 @@ class CatalogTest {
   }
 
   @Test
+  fun `a stored policy name round-trips`() {
+    AcceleratorPolicy.entries.forEach {
+      assertEquals(it, AcceleratorPolicy.fromStoredName(it.name))
+    }
+  }
+
+  @Test
+  fun `an unreadable stored policy falls back instead of failing`() {
+    // This runs while the view model is being constructed, so anything that throws here
+    // is a launch crash rather than a wrong setting.
+    assertEquals(AcceleratorPolicy.AUTO, AcceleratorPolicy.fromStoredName(null))
+    assertEquals(AcceleratorPolicy.AUTO, AcceleratorPolicy.fromStoredName(""))
+    assertEquals(AcceleratorPolicy.AUTO, AcceleratorPolicy.fromStoredName("REMOVED_IN_A_LATER_VERSION"))
+  }
+
+  @Test
   fun `formatBytes is readable at every scale`() {
     assertEquals("512 B", formatBytes(512))
     assertEquals("1.0 KiB", formatBytes(1024))
