@@ -2,6 +2,7 @@ package dev.neuroforge.core
 
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
 class CatalogTest {
@@ -144,6 +145,59 @@ class CatalogTest {
     assertEquals(AcceleratorPolicy.AUTO, AcceleratorPolicy.fromStoredName(null))
     assertEquals(AcceleratorPolicy.AUTO, AcceleratorPolicy.fromStoredName(""))
     assertEquals(AcceleratorPolicy.AUTO, AcceleratorPolicy.fromStoredName("REMOVED_IN_A_LATER_VERSION"))
+  }
+
+  @Test
+  fun `the exact expected file wins when it is present`() {
+    val files = listOf("model_int8.tflite", "model.tflite", "readme.md")
+    assertEquals("model.tflite", chooseModelFile(files, "model.tflite", listOf("int8")))
+  }
+
+  @Test
+  fun `a renamed file is found by its hints`() {
+    // The failure this exists for: the catalogued name 404'd on device because it was a
+    // guess. Given the real listing, the int8 variant still has to be picked out.
+    val files = listOf(
+      "mobilenet_v3_small.tflite",
+      "mobilenet_v3_small_int8_dynamic.tflite",
+      "config.json",
+    )
+    assertEquals(
+      "mobilenet_v3_small_int8_dynamic.tflite",
+      chooseModelFile(files, "mobilenet_v3_small_int8_channelwise.tflite", listOf("int8")),
+    )
+  }
+
+  @Test
+  fun `more hint matches beat fewer`() {
+    val files = listOf("dit_fp16.tflite", "dit_int4.tflite", "encoder_int4.tflite")
+    assertEquals(
+      "dit_int4.tflite",
+      chooseModelFile(files, "missing.tflite", listOf("dit", "int4")),
+    )
+  }
+
+  @Test
+  fun `ties break toward the shorter name`() {
+    val files = listOf("model_int8_experimental_v2.tflite", "model_int8.tflite")
+    assertEquals("model_int8.tflite", chooseModelFile(files, "nope.tflite", listOf("int8")))
+  }
+
+  @Test
+  fun `nothing matching the hints returns null rather than a wrong file`() {
+    // Downloading the wrong graph is worse than failing: it fails later, inside the loader.
+    val files = listOf("model_fp32.tflite")
+    assertNull(chooseModelFile(files, "model_int8.tflite", listOf("int8")))
+  }
+
+  @Test
+  fun `a listing with no models at all returns null`() {
+    assertNull(chooseModelFile(listOf("README.md", "config.json"), "m.tflite", listOf("int8")))
+  }
+
+  @Test
+  fun `with no hints any model is acceptable`() {
+    assertEquals("only.tflite", chooseModelFile(listOf("only.tflite"), "other.tflite", emptyList()))
   }
 
   @Test
