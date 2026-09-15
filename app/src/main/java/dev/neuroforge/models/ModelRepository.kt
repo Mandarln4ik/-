@@ -3,6 +3,8 @@ package dev.neuroforge.models
 import android.content.Context
 import android.util.Log
 import dev.neuroforge.core.ModelFile
+import dev.neuroforge.core.ModelSource
+import dev.neuroforge.core.chooseModelFile
 import dev.neuroforge.core.ModelSpec
 import dev.neuroforge.core.Provenance
 import dev.neuroforge.core.Tar
@@ -22,6 +24,7 @@ import kotlinx.coroutines.withContext
 import kotlin.coroutines.coroutineContext
 import okhttp3.OkHttpClient
 import okhttp3.Request
+import org.json.JSONArray
 
 /** Where a model stands on this device. */
 sealed interface ModelState {
@@ -128,8 +131,9 @@ class ModelRepository(private val context: Context) {
     val part = partFor(spec, file)
     part.delete()
 
-    val request = Request.Builder().url(file.downloadUrl()).build()
     val digest = MessageDigest.getInstance("SHA-256")
+    val url = resolveUrl(file)
+    val request = Request.Builder().url(url).build()
 
     http.newCall(request).execute().use { response ->
       if (!response.isSuccessful) {
@@ -196,6 +200,57 @@ class ModelRepository(private val context: Context) {
 
     Log.i(TAG, "ready: ${file.fileName} (${target.length()} bytes)")
   }.flowOn(Dispatchers.IO)
+
+  /**
+   * Works out the URL to fetch, listing the repository when the expected name is not there.
+   *
+   * A catalogued file name is a claim about someone else's repository, and repositories get
+   * re-quantised and renamed. Rather than let that surface as a 404 on the device — which is
+   * exactly how this failed — an HTTP 404 triggers one listing call, and the file is chosen
+   * from what actually exists.
+   */
+  private fun resolveUrl(file: ModelFile): String {
+    val declared = file.downloadUrl()
+    val source = file.source
+    if (source !is ModelSource.HuggingFace) return declared
+    if (headOk(declared)) return declared
+
+    Log.w(TAG, "${source.path} is not in ${source.repoId}; listing the repository")
+    val available = listHuggingFaceFiles(source.repoId)
+    if (available.isEmpty()) {
+      throw IOException(
+        "'${source.path}' was not found in ${source.repoId} and the repository could not " +
+          "be listed. Check the model page, or side-load the file."
+      )
+    }
+    val chosen = chooseModelFile(available, source.path, source.hints)
+      ?: throw IOException(
+        "'${source.path}' was not found in ${source.repoId}. It contains: " +
+          available.joinToString(", ").take(400)
+      )
+    Log.i(TAG, "resolved ${source.path} -> $chosen")
+    return "${ModelFile.HF_ENDPOINT}/${source.repoId}/resolve/main/$chosen?download=true"
+  }
+
+  /** True when the URL exists; a failed probe is treated as "present" so a flaky network
+   *  does not trigger a pointless listing and a misleading error. */
+  private fun headOk(url: String): Boolean = runCatching {
+    http.newCall(Request.Builder().url(url).head().build()).execute()
+      .use { it.isSuccessful || it.code != 404 }
+  }.getOrDefault(true)
+
+  /** File paths at the root of a Hugging Face model repository. */
+  private fun listHuggingFaceFiles(repoId: String): List<String> = runCatching {
+    val url = "${ModelFile.HF_ENDPOINT}/api/models/$repoId/tree/main"
+    http.newCall(Request.Builder().url(url).build()).execute().use { response ->
+      if (!response.isSuccessful) return emptyList()
+      val body = response.body?.string().orEmpty()
+      val array = JSONArray(body)
+      (0 until array.length()).mapNotNull { i ->
+        array.optJSONObject(i)?.takeIf { it.optString("type") == "file" }?.optString("path")
+      }.filter { it.isNotBlank() }
+    }
+  }.onFailure { Log.w(TAG, "could not list $repoId", it) }.getOrDefault(emptyList())
 
   /**
    * Pulls one member out of a gzipped tar into [target].

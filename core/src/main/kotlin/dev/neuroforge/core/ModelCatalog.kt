@@ -82,11 +82,58 @@ enum class Provenance {
 
 /** Where a file is fetched from. */
 sealed interface ModelSource {
-  /** A file inside a Hugging Face repository. */
-  data class HuggingFace(val repoId: String, val path: String) : ModelSource
+  /**
+   * A file inside a Hugging Face repository.
+   *
+   * @param path the expected file name. Repositories rename and re-quantise files without
+   *   warning, and a name that is merely plausible produces a 404 at the worst moment — on
+   *   someone's phone, at the point they press Download. So [hints] exists: when [path] is
+   *   not there, the repository is listed and the file is picked by these instead.
+   * @param hints lowercase substrings that identify the right file among the repo's other
+   *   `.tflite` files, most significant first.
+   */
+  data class HuggingFace(
+    val repoId: String,
+    val path: String,
+    val hints: List<String> = emptyList(),
+  ) : ModelSource
 
   /** Any direct URL — a GitHub release asset, a mirror. */
   data class Direct(val url: String, val origin: String) : ModelSource
+}
+
+/**
+ * Picks the right model file from a repository listing.
+ *
+ * Kept pure and tested because the alternative — a hardcoded file name — is what broke:
+ * the name was a plausible guess from a search result, could not be verified offline, and
+ * 404'd on the device. Scoring a real listing removes the guess.
+ *
+ * Preference order: the exact expected name; then the candidate matching the most [hints],
+ * breaking ties toward the shortest name so `model_int8.tflite` wins over
+ * `model_int8_experimental_v2.tflite`.
+ */
+fun chooseModelFile(
+  available: List<String>,
+  expected: String,
+  hints: List<String>,
+  extension: String = ".tflite",
+): String? {
+  val candidates = available.filter { it.endsWith(extension, ignoreCase = true) }
+  if (candidates.isEmpty()) return null
+  candidates.firstOrNull { it.equals(expected, ignoreCase = true) }?.let { return it }
+
+  return candidates
+    .map { name ->
+      val lower = name.lowercase()
+      name to hints.count { lower.contains(it.lowercase()) }
+    }
+    .filter { (_, score) -> hints.isEmpty() || score > 0 }
+    .minWithOrNull(
+      compareByDescending<Pair<String, Int>> { it.second }.thenBy { it.first.length }
+        .thenBy { it.first },
+    )
+    ?.first
 }
 
 /**
@@ -197,6 +244,10 @@ object ModelCatalog {
         source = ModelSource.HuggingFace(
           repoId = "litert-community/MobileNet-v3-small",
           path = "mobilenet_v3_small_int8_channelwise.tflite",
+          // The exact name could not be verified when this entry was written, and the guess
+          // was wrong: it 404'd on device. These pick the int8 variant out of the listing
+          // whatever it ends up being called.
+          hints = listOf("int8", "quant"),
         ),
         sizeBytes = 0L,
       )
@@ -259,6 +310,7 @@ object ModelCatalog {
         fileName = "bonsai_text_encoder_int4.tflite",
         source = ModelSource.HuggingFace(
           "litert-community/Bonsai-Image-ternary-4B", "text_encoder_int4.tflite",
+          hints = listOf("text_encoder", "int4"),
         ),
         sizeBytes = 1_803_886_592L,
       ),
@@ -285,6 +337,7 @@ object ModelCatalog {
         fileName = "bonsai_dit_int4.tflite",
         source = ModelSource.HuggingFace(
           "litert-community/Bonsai-Image-ternary-4B", "dit_int4.tflite",
+          hints = listOf("dit", "int4"),
         ),
         sizeBytes = 2_265_524_224L,
       )
@@ -304,6 +357,7 @@ object ModelCatalog {
         fileName = "bonsai_vae_decoder.tflite",
         source = ModelSource.HuggingFace(
           "litert-community/Bonsai-Image-ternary-4B", "vae_decoder.tflite",
+          hints = listOf("vae", "decoder"),
         ),
         sizeBytes = 204_010_496L,
       )

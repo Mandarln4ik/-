@@ -38,6 +38,7 @@ data class UiState(
   val downloads: Map<String, DownloadProgress> = emptyMap(),
   val benchmark: BenchmarkReport? = null,
   val benchmarkRunning: Boolean = false,
+  val benchmarkModel: String? = null,
   val generation: GenerationProgress? = null,
   val result: GenerationResult? = null,
   val plan: RenderPlan? = null,
@@ -145,16 +146,26 @@ class AppViewModel(private val app: NeuroForgeApp) : ViewModel() {
    */
   fun runBenchmark() {
     if (_state.value.benchmarkRunning) return
-    val spec = ModelCatalog.BENCHMARK_MOBILENET
-    val file = app.repository.fileFor(spec, spec.files.first())
-    if (!file.isFile) {
-      _state.update { it.copy(error = "Download the benchmark model first (${spec.displayName}).") }
+    // Any downloaded graph with a declared input shape will do. Pinning this to one model
+    // is what made the feature unreachable when that model's download failed - and the
+    // upscaler is arguably the better subject anyway, since it is the graph the NPU is
+    // actually meant to run.
+    val spec = benchmarkable().firstOrNull { app.repository.isReady(it) }
+    if (spec == null) {
+      _state.update {
+        it.copy(
+          error = "Download a model with a fixed input first — the smoke test or the " +
+            "upscaler, either works.",
+        )
+      }
       return
     }
+    val file = app.repository.fileFor(spec, spec.files.first())
     viewModelScope.launch {
       _state.update { it.copy(benchmarkRunning = true, error = null) }
       try {
         val report = Benchmark.compare(app, spec, file)
+        _state.update { it.copy(benchmarkModel = spec.displayName) }
         _state.update { it.copy(benchmark = report, benchmarkRunning = false) }
         // A benchmark that reached the NPU is proof the probe's static answer was right.
         val verified = report.results.filter { r -> r.ok }.map { r -> r.accelerator }
@@ -186,6 +197,11 @@ class AppViewModel(private val app: NeuroForgeApp) : ViewModel() {
       }
     }
   }
+
+  /** Models the benchmark can drive, most appropriate first. */
+  fun benchmarkable(): List<ModelSpec> =
+    listOf(ModelCatalog.BENCHMARK_MOBILENET, ModelCatalog.UPSCALER_ESRGAN_X4)
+      .filter { it.inputShape != null }
 
   fun cancelGeneration() {
     generationJob?.cancel()

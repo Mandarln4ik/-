@@ -85,7 +85,8 @@ fun DeviceScreen(vm: AppViewModel, state: UiState) {
         SectionCard("Measure it") {
           Text(
             "Runs the same graph on NPU, GPU and CPU and reports median latency. This is the " +
-              "only claim on this screen that is evidence rather than inference.",
+              "only claim on this screen that is evidence rather than inference. Any " +
+              "downloaded model with a fixed input works — get one from the Models tab.",
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
           )
@@ -99,6 +100,15 @@ fun DeviceScreen(vm: AppViewModel, state: UiState) {
             if (state.benchmarkRunning) {
               CircularProgressIndicator(Modifier.padding(top = 8.dp))
             }
+          }
+
+          state.benchmarkModel?.let { name ->
+            Text(
+              "Model: $name",
+              style = MaterialTheme.typography.labelSmall,
+              color = MaterialTheme.colorScheme.onSurfaceVariant,
+              modifier = Modifier.padding(top = 10.dp),
+            )
           }
 
           state.benchmark?.let { report ->
