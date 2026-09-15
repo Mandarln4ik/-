@@ -68,9 +68,10 @@ object Benchmark {
     iterations: Int,
     warmup: Int,
   ): BenchmarkResult {
-    // A single-element preference list: this must measure *this* accelerator, so a silent
-    // fallback to another one would make the whole comparison meaningless.
-    LiteRtSession.load(context, spec.displayName, modelFile, listOf(accel)).use { session ->
+    // A single-element preference plus strict mode: this must measure *this* accelerator,
+    // so a silent fallback would make the whole comparison meaningless.
+    LiteRtSession.load(context, spec.displayName, modelFile, listOf(accel), strict = true)
+      .use { session ->
       if (session.accelerator != accel) {
         return BenchmarkResult(
           spec.displayName, accel, emptyList(), 0.0,
@@ -83,7 +84,7 @@ object Benchmark {
 
       repeat(warmup + iterations) {
         coroutineContext.ensureActive()
-        session.writeInput(0, input)
+        session.writeInputForTiming(0, input)
         samples += session.run().toDouble()
       }
 

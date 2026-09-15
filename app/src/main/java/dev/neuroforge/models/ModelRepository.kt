@@ -5,10 +5,14 @@ import android.util.Log
 import dev.neuroforge.core.ModelFile
 import dev.neuroforge.core.ModelSpec
 import dev.neuroforge.core.Provenance
+import dev.neuroforge.core.Tar
 import java.io.File
 import java.io.IOException
+import java.io.InputStream
+import java.security.DigestInputStream
 import java.security.MessageDigest
 import java.util.concurrent.TimeUnit
+import java.util.zip.GZIPInputStream
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.Flow
@@ -21,16 +25,13 @@ import okhttp3.Request
 
 /** Where a model stands on this device. */
 sealed interface ModelState {
-  /** Present, size checked, and checksum verified if one was pinned. */
-  data class Ready(val file: File, val bytes: Long, val checksumVerified: Boolean) : ModelState
+  /** Present and usable. */
+  data class Ready(val file: File, val bytes: Long) : ModelState
 
   /** Not downloaded yet. */
   data object Absent : ModelState
 
-  /** Partially downloaded; a resumed download continues from [bytes]. */
-  data class Partial(val bytes: Long, val total: Long) : ModelState
-
-  /** On disk but wrong — truncated, or the digest does not match. */
+  /** On disk but wrong — truncated, or the digest did not match. */
   data class Corrupt(val reason: String) : ModelState
 
   /** Published upstream in a format that needs converting first; see docs/MODELS.md. */
@@ -43,6 +44,7 @@ data class DownloadProgress(
   val downloaded: Long,
   val total: Long,
   val bytesPerSecond: Long,
+  val stage: String = "downloading",
 ) {
   val fraction: Float get() = if (total > 0) (downloaded.toFloat() / total).coerceIn(0f, 1f) else 0f
   val etaSeconds: Long
@@ -52,10 +54,13 @@ data class DownloadProgress(
 /**
  * Fetches and keeps track of model weights.
  *
- * The files here are large — the diffusion transformer alone is over 2 GiB — which drives
- * every design choice in this class: downloads resume rather than restart, files are
- * verified before the first run rather than after a confusing failure, and a partially
- * written file is never handed to the runtime under its final name.
+ * Two things drive the design. The files are large — the diffusion transformer alone is
+ * over 2 GiB — so a partially written file is never given its final name, and nothing is
+ * handed to the runtime until its length and, where pinned, its digest check out.
+ *
+ * And some models are published only as a `.tar.gz` release asset. Unpacking those here,
+ * on the phone, is deliberate: the alternative is telling someone to fetch and unpack it
+ * on a desktop first, which is the step this app is meant to remove.
  */
 class ModelRepository(private val context: Context) {
 
@@ -65,10 +70,11 @@ class ModelRepository(private val context: Context) {
     OkHttpClient.Builder()
       .connectTimeout(30, TimeUnit.SECONDS)
       // No read timeout: a slow link on a 2 GiB body is not a stalled connection, and
-      // killing it at 30 s would make the large models undownloadable on exactly the
-      // connections that most need resumable downloads.
+      // cutting it at 30 s would make the large models undownloadable on exactly the
+      // connections that most need patience.
       .readTimeout(0, TimeUnit.SECONDS)
       .retryOnConnectionFailure(true)
+      .followRedirects(true)
       .build()
   }
 
@@ -80,93 +86,87 @@ class ModelRepository(private val context: Context) {
   /** Total bytes currently occupied by downloaded models. */
   fun diskUsage(): Long = root.walkTopDown().filter { it.isFile }.sumOf { it.length() }
 
-  /** State of every file in [spec]; the model is usable only when all of them are [ModelState.Ready]. */
+  /** State of every file in [spec]; the model is usable only when all are [ModelState.Ready]. */
   fun stateOf(spec: ModelSpec): Map<String, ModelState> =
     spec.files.associate { it.fileName to stateOfFile(spec, it) }
 
-  /** Convenience: is every file of [spec] present and valid? */
-  fun isReady(spec: ModelSpec): Boolean =
-    stateOf(spec).values.all { it is ModelState.Ready }
+  /** Convenience: is every file of [spec] present? */
+  fun isReady(spec: ModelSpec): Boolean = stateOf(spec).values.all { it is ModelState.Ready }
 
   fun stateOfFile(spec: ModelSpec, file: ModelFile): ModelState {
     val target = fileFor(spec, file)
     if (target.isFile) {
-      // Size is checked every time because it is free; the digest is not, so it is only
-      // verified on demand via `verify`, and Ready reports which of the two it is standing on.
-      if (file.sizeBytes > 0 && target.length() != file.sizeBytes) {
+      // For an archive the stored size describes the download, not the extracted member,
+      // so only a direct download can be length-checked here.
+      if (!file.isArchive && file.sizeBytes > 0 && target.length() != file.sizeBytes) {
         return ModelState.Corrupt(
           "expected ${file.sizeBytes} bytes, found ${target.length()} — delete and re-download"
         )
       }
-      return ModelState.Ready(target, target.length(), checksumVerified = false)
+      return ModelState.Ready(target, target.length())
     }
-    val part = partFor(spec, file)
-    if (part.isFile && part.length() > 0) return ModelState.Partial(part.length(), file.sizeBytes)
     if (file.provenance == Provenance.NEEDS_CONVERSION) {
-      return ModelState.NeedsConversion("docs/MODELS.md — ${file.repoId}")
+      return ModelState.NeedsConversion("docs/MODELS.md — ${file.originLabel()}")
     }
     return ModelState.Absent
   }
 
   /**
-   * Downloads one file, resuming a previous attempt when possible.
+   * Downloads one file and, if it is an archive, unpacks the member the catalogue names.
    *
-   * Emits progress as it goes. The body is written to a `.part` sibling and renamed only
-   * after the length checks pass, so an interrupted download can never be mistaken for a
-   * complete model — that failure mode surfaces as an incomprehensible native crash hours
-   * later, and it is worth a few lines to make impossible.
+   * The body is written to a `.part` sibling and only renamed once every check passes, so
+   * an interrupted download can never be mistaken for a complete model — a failure mode
+   * that otherwise surfaces as an unreadable native crash much later.
+   *
+   * Downloads restart rather than resume. Range resumption was removed when archives
+   * arrived: a resumed archive cannot be hashed as one stream, and a checksum that is
+   * sometimes skipped is worse than one that always runs.
    */
   fun download(spec: ModelSpec, file: ModelFile): Flow<DownloadProgress> = flow {
     val target = fileFor(spec, file)
     target.parentFile?.mkdirs()
     val part = partFor(spec, file)
+    part.delete()
 
-    val existing = if (part.isFile) part.length() else 0L
-    val request = Request.Builder()
-      .url(file.downloadUrl())
-      .apply { if (existing > 0) header("Range", "bytes=$existing-") }
-      .build()
+    val request = Request.Builder().url(file.downloadUrl()).build()
+    val digest = MessageDigest.getInstance("SHA-256")
 
     http.newCall(request).execute().use { response ->
       if (!response.isSuccessful) {
-        throw IOException("HTTP ${response.code} fetching ${file.fileName} from ${file.repoId}")
+        throw IOException(
+          "HTTP ${response.code} fetching ${file.fileName} from ${file.originLabel()}"
+        )
       }
-      // A server that ignores the Range header restarts the body at 0; appending then would
-      // silently corrupt the file, so fall back to a clean rewrite.
-      val resumed = existing > 0 && response.code == 206
       val body = response.body ?: throw IOException("empty body for ${file.fileName}")
-      val total = (body.contentLength().takeIf { it > 0 } ?: 0L) + (if (resumed) existing else 0L)
+      val total = body.contentLength().takeIf { it > 0 } ?: file.sizeBytes
 
-      var written = if (resumed) existing else 0L
-      val sink = java.io.RandomAccessFile(part, "rw")
-      sink.use { out ->
-        out.setLength(written)
-        out.seek(written)
+      var written = 0L
+      var lastEmit = System.nanoTime()
+      var lastBytes = 0L
+      var rate = 0L
 
-        val buffer = ByteArray(1 shl 16)
-        val source = body.byteStream()
-        var lastEmit = System.nanoTime()
-        var lastBytes = written
-        var rate = 0L
+      DigestInputStream(body.byteStream(), digest).use { source ->
+        part.outputStream().buffered(1 shl 16).use { out ->
+          val buffer = ByteArray(1 shl 16)
+          while (true) {
+            coroutineContext.ensureActive()
+            val n = source.read(buffer)
+            if (n <= 0) break
+            out.write(buffer, 0, n)
+            written += n
 
-        while (true) {
-          coroutineContext.ensureActive()
-          val n = source.read(buffer)
-          if (n <= 0) break
-          out.write(buffer, 0, n)
-          written += n
-
-          val now = System.nanoTime()
-          val dt = now - lastEmit
-          if (dt > 200_000_000L) { // ~5 updates/s is plenty for a progress bar
-            rate = ((written - lastBytes) * 1_000_000_000L) / dt
-            lastEmit = now
-            lastBytes = written
-            emit(DownloadProgress(file.fileName, written, maxOf(total, file.sizeBytes), rate))
+            val now = System.nanoTime()
+            val dt = now - lastEmit
+            if (dt > 200_000_000L) { // ~5 updates/s is plenty for a progress bar
+              rate = ((written - lastBytes) * 1_000_000_000L) / dt
+              lastEmit = now
+              lastBytes = written
+              emit(DownloadProgress(file.fileName, written, total, rate))
+            }
           }
         }
-        emit(DownloadProgress(file.fileName, written, maxOf(total, file.sizeBytes), rate))
       }
+      emit(DownloadProgress(file.fileName, written, total, rate))
     }
 
     if (file.sizeBytes > 0 && part.length() != file.sizeBytes) {
@@ -175,35 +175,65 @@ class ModelRepository(private val context: Context) {
         "${file.fileName}: downloaded ${part.length()} bytes, catalogue expects ${file.sizeBytes}"
       )
     }
-    if (!part.renameTo(target)) {
+
+    file.sha256?.let { expected ->
+      val actual = digest.digest().joinToString("") { "%02x".format(it) }
+      if (!actual.equals(expected, ignoreCase = true)) {
+        part.delete()
+        throw IOException("${file.fileName}: checksum mismatch (got $actual)")
+      }
+      Log.i(TAG, "${file.fileName}: checksum verified")
+    }
+
+    val member = file.archiveMember
+    if (member != null) {
+      emit(DownloadProgress(file.fileName, part.length(), part.length(), 0, stage = "unpacking"))
+      extractFromTarGz(part, member, target)
+      part.delete()
+    } else if (!part.renameTo(target)) {
       throw IOException("could not finalise ${file.fileName}")
     }
-    Log.i(TAG, "downloaded ${file.fileName} (${target.length()} bytes)")
+
+    Log.i(TAG, "ready: ${file.fileName} (${target.length()} bytes)")
   }.flowOn(Dispatchers.IO)
 
   /**
-   * Recomputes the SHA-256 of a downloaded file.
+   * Pulls one member out of a gzipped tar into [target].
    *
-   * Returns null when the catalogue has no digest pinned for it — reporting "unverified"
-   * rather than "verified" for a file nothing was ever checked against.
+   * Skips AppleDouble sidecars explicitly. An archive built on macOS carries a `._name`
+   * entry beside every real one, with the same extension — matching on the extension alone
+   * extracts a few hundred bytes of resource fork, and the failure then appears inside the
+   * model loader rather than here.
    */
-  suspend fun verify(spec: ModelSpec, file: ModelFile): Boolean? = withContext(Dispatchers.IO) {
-    val expected = file.sha256 ?: return@withContext null
-    val target = fileFor(spec, file)
-    if (!target.isFile) return@withContext false
+  private fun extractFromTarGz(archive: File, member: String, target: File) {
+    GZIPInputStream(archive.inputStream().buffered(1 shl 16)).use { gz ->
+      val entry = Tar.seek(gz) { candidate ->
+        candidate.isFile &&
+          !Tar.isAppleDoubleSidecar(candidate.name) &&
+          candidate.name.substringAfterLast('/') == member
+      } ?: throw IOException("'$member' not found inside ${archive.name}")
 
-    val digest = MessageDigest.getInstance("SHA-256")
-    target.inputStream().buffered(1 shl 16).use { input ->
-      val buffer = ByteArray(1 shl 16)
-      while (true) {
-        coroutineContext.ensureActive()
-        val n = input.read(buffer)
-        if (n <= 0) break
-        digest.update(buffer, 0, n)
+      val tmp = File(target.parentFile, "${target.name}.extract")
+      tmp.outputStream().buffered(1 shl 16).use { out ->
+        copyExactly(gz, out, entry.size)
       }
+      if (!tmp.renameTo(target)) {
+        tmp.delete()
+        throw IOException("could not write extracted $member")
+      }
+      Log.i(TAG, "extracted $member (${entry.size} bytes)")
     }
-    val actual = digest.digest().joinToString("") { "%02x".format(it) }
-    actual.equals(expected, ignoreCase = true)
+  }
+
+  private fun copyExactly(source: InputStream, sink: java.io.OutputStream, bytes: Long) {
+    val buffer = ByteArray(1 shl 16)
+    var remaining = bytes
+    while (remaining > 0) {
+      val n = source.read(buffer, 0, minOf(remaining, buffer.size.toLong()).toInt())
+      if (n < 0) throw IOException("archive ended after ${bytes - remaining} of $bytes bytes")
+      sink.write(buffer, 0, n)
+      remaining -= n
+    }
   }
 
   /** Removes every file of [spec], including a stale partial download. */

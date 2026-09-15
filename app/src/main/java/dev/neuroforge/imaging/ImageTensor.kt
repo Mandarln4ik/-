@@ -5,18 +5,37 @@ import android.graphics.Canvas
 import android.graphics.Paint
 import android.graphics.Rect
 import androidx.core.graphics.createBitmap
+import dev.neuroforge.core.InputRange
 
 /** How pixel values map onto tensor values. */
 enum class Normalization(val scale: Float, val bias: Float) {
-  /** `[0, 255]` → `[0, 1]`. What super-resolution networks expect. */
+  /** `[0, 255]` → `[0, 1]`. The common convention for vision networks. */
   UNIT(1f / 255f, 0f),
 
-  /** `[0, 255]` → `[-1, 1]`. What VAE encoders and most classifiers expect. */
-  SIGNED(2f / 255f, -1f);
+  /** `[0, 255]` → `[-1, 1]`. VAE decoders and most classifiers. */
+  SIGNED(2f / 255f, -1f),
+
+  /**
+   * `[0, 255]` float, passed through unchanged.
+   *
+   * Rarer, and the one that fails invisibly if assumed wrong: the ESRGAN graph this app
+   * uses wants this, and fed `[0, 1]` it returns values spanning roughly -5 to 10 — noise,
+   * not a slightly worse image.
+   */
+  BYTE(1f, 0f);
 
   fun toTensor(byteValue: Int): Float = byteValue * scale + bias
   fun toPixel(tensorValue: Float): Int =
     (((tensorValue - bias) / scale) + 0.5f).toInt().coerceIn(0, 255)
+
+  companion object {
+    /** The convention a catalogue entry declares. */
+    fun of(range: InputRange): Normalization = when (range) {
+      InputRange.UNIT -> UNIT
+      InputRange.SIGNED -> SIGNED
+      InputRange.BYTE -> BYTE
+    }
+  }
 }
 
 /**
