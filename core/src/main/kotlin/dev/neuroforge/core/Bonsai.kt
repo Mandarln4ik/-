@@ -138,9 +138,21 @@ object Bonsai {
    * text in this exact shape, and feeding it a naked sentence shifts every embedding.
    *
    * Spelled out here because rendering the repository's Jinja template on a phone is not
-   * worth a template engine. It is pinned by a unit test, and CI prints the repository's
-   * own `chat_template` next to it on every commit, so a divergence is visible rather than
-   * theoretical.
+   * worth a template engine — but it is not a guess. CI reads the repository's own
+   * `chat_template.jinja` on every commit and prints it beside this rendering. The two
+   * lines that produce it are:
+   *
+   * ```jinja
+   * {{- '<|im_start|>' + message.role + '\n' + content + '<|im_end|>' + '\n' }}
+   * ...
+   * {{- '<|im_start|>assistant\n' }}
+   * {%- if enable_thinking is defined and enable_thinking is false %}
+   *     {{- '<think>\n\n</think>\n\n' }}
+   * ```
+   *
+   * which is character for character what this returns for a single user turn. A future
+   * re-release that changes the template shows up in that log rather than as an image that
+   * quietly answers a slightly different prompt.
    */
   fun chatPrompt(prompt: String): String =
     "<|im_start|>user\n$prompt<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
