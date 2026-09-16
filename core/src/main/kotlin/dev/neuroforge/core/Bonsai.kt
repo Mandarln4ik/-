@@ -108,6 +108,28 @@ object Bonsai {
   }
 
   /**
+   * Turns the DiT's packed output into the tensor the VAE decoder takes.
+   *
+   * The whole of `unpatchify()` in the reference, in one call and in its order: the
+   * per-packed-channel affine first, then the 2×2 patch unfold. Both steps are individually
+   * plausible in either order and only one is right — `bn_scale` is 128 long, which lines up
+   * with the packed axis and nothing else — so they are kept together rather than left for
+   * a caller to sequence.
+   *
+   * @param tokens `TOKENS × PACKED_CHANNELS`; consumed and overwritten.
+   * @return the latent flattened CHW, ready for the decoder.
+   */
+  fun toVaeLatent(
+    tokens: FloatArray,
+    scale: FloatArray,
+    shift: FloatArray,
+    spec: LatentSpec = latent,
+    latentSide: Int = IMAGE_SIZE / latent.vaeScale,
+  ): FloatArray = LatentPacking.unpatchify(
+    denormalize(tokens, scale, shift), spec, latentSide, latentSide,
+  )
+
+  /**
    * Wraps a prompt in the chat template the text encoder's tokenizer applies.
    *
    * The encoder is a pruned Qwen3-4B, and the reference calls `apply_chat_template(...,

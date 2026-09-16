@@ -9,7 +9,6 @@ import dev.neuroforge.core.AcceleratorPolicy
 import dev.neuroforge.core.Bonsai
 import dev.neuroforge.core.FlowMatchEulerScheduler
 import dev.neuroforge.core.GraphBinding
-import dev.neuroforge.core.LatentPacking
 import dev.neuroforge.core.LatentSpec
 import dev.neuroforge.core.ModelCatalog
 import dev.neuroforge.core.ModelSpec
@@ -242,11 +241,11 @@ class GenerationPipeline(
 
     // ---- 3. Decode -------------------------------------------------------------------
     report(GenerationStage.Decoding, 0.62f, "Decoding latent")
-    // Affine first, on the packed axis, then the patch unfold — the only order in which a
-    // 128-wide vector lines up with anything.
-    Bonsai.denormalize(latent, meta.latentBnScale, meta.latentBnShift)
-    val vaeLatent = LatentPacking.unpatchify(
-      latent, contract.latent, contract.latentSide, contract.latentSide,
+    // Affine on the packed axis, then the patch unfold — one call, because both steps are
+    // plausible in either order and only one is right. Checked at the real shape against a
+    // numpy run of the reference's own `unpatchify()`.
+    val vaeLatent = Bonsai.toVaeLatent(
+      latent, meta.latentBnScale, meta.latentBnShift, contract.latent, contract.latentSide,
     )
 
     val baseImage = stage(ModelCatalog.BONSAI_VAE, timings, "VAE decoder", request.policy) { session ->

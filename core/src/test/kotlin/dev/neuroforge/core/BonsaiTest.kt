@@ -125,4 +125,62 @@ class BonsaiTest {
     assertTrue(Bonsai.chatPrompt("x") != "x")
     assertTrue(Bonsai.chatPrompt("x").contains("<|im_start|>"))
   }
+
+  @Test
+  fun `the full latent decode matches a numpy run of the reference`() {
+    // The strongest check in this file: it runs the reference's `unpatchify()` at its real
+    // shape and compares against values computed by numpy from generate.py's own code.
+    //
+    // The inputs vary along both axes, so a transposed read, a wrong stride or the affine
+    // applied after the unfold all move the answer. The step sizes between probes are
+    // deliberately uneven — 64 is a row, 4096 is a channel — so an off-by-one in either
+    // direction shows up.
+    val tokens = FloatArray(Bonsai.TOKENS * Bonsai.PACKED_CHANNELS) { i ->
+      val t = i / Bonsai.PACKED_CHANNELS
+      val m = i % Bonsai.PACKED_CHANNELS
+      ((t * 131 + m * 7) % 1000) / 1000.0f
+    }
+    val scale = FloatArray(Bonsai.PACKED_CHANNELS) { 1.0f + (it % 17) / 100.0f }
+    val shift = FloatArray(Bonsai.PACKED_CHANNELS) { (it % 11) / 10.0f - 0.5f }
+
+    val out = Bonsai.toVaeLatent(tokens, scale, shift)
+
+    assertEquals(32 * 64 * 64, out.size)
+    val expected = mapOf(
+      0 to -0.500000f, 1 to -0.392930f, 63 to -0.331320f, 64 to -0.285720f,
+      65 to -0.178370f, 4095 to -0.164980f, 4096 to -0.070880f, 65535 to 0.808480f,
+      70000 to -0.081640f, 131071 to 1.074160f,
+    )
+    expected.forEach { (i, want) -> assertEquals(want, out[i], 1e-5f, "element $i") }
+
+    // Aggregates too: the probes above could all agree while a whole region is wrong.
+    var sum = 0.0
+    out.forEach { sum += it }
+    assertEquals(69083.09f, sum.toFloat(), 1f)
+    assertEquals(1.648850f, out.max(), 1e-5f)
+    assertEquals(-0.500000f, out.min(), 1e-5f)
+  }
+
+  @Test
+  fun `decoding applies the affine before the unfold, not after`() {
+    // Both orders run and both produce a correctly shaped latent. Only one is right, and
+    // the wrong one scatters each channel's correction across the image.
+    // A 2x2 grid, not 1x1: with a single token the unfold is the identity and the two
+    // orders agree by accident, which would make this test pass while proving nothing.
+    val spec = LatentSpec(channels = 2, vaeScale = 8, patch = 2)
+    val side = 4
+    val width = spec.tokenDim()
+    val tokens = FloatArray(4 * width) { (it + 1).toFloat() }
+    val scale = FloatArray(width) { if (it == 0) 10f else 1f }
+    val shift = FloatArray(width)
+
+    val correct = Bonsai.toVaeLatent(tokens.copyOf(), scale, shift, spec, latentSide = side)
+    // Packed channel 0 is c=0, i=0, j=0, so token (0,0)'s scaled value lands at z[0][0][0].
+    assertEquals(10f, correct[0])
+
+    val wrongOrder = Bonsai.denormalize(
+      LatentPacking.unpatchify(tokens.copyOf(), spec, side, side), scale, shift,
+    )
+    assertTrue(!wrongOrder.contentEquals(correct), "the two orders must be distinguishable")
+  }
 }
