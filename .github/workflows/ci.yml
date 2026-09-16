@@ -129,8 +129,11 @@ jobs:
           force-avd-creation: false
           emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
           disable-animations: true
+          # Plain `sh`, not bash: the action runs this script with /usr/bin/sh, so `set -o
+          # pipefail` is a syntax error that fails the step before the app is ever installed
+          # - which looked exactly like a launch crash in the log.
           script: |
-            set -uo pipefail
+            set -u
             adb install -r app/build/outputs/apk/debug/app-debug.apk
             adb logcat -c
             adb shell am start -W -n dev.neuroforge/.MainActivity
