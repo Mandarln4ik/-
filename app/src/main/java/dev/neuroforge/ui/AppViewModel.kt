@@ -92,10 +92,20 @@ class AppViewModel(private val app: NeuroForgeApp) : ViewModel() {
    */
   val policy = MutableStateFlow(loadPolicy())
 
+  /**
+   * Hugging Face access token, for gated and private repositories.
+   *
+   * Kept in the same preferences file as everything else, which is app-private storage.
+   * That is not a secret store — it is the same protection the rest of the app's state
+   * gets, and a read token for a public model hub is the right thing at that level.
+   */
+  val hfToken = MutableStateFlow(prefs().getString(KEY_HF_TOKEN, "").orEmpty())
+
   private var generationJob: Job? = null
   private val downloadJobs = mutableMapOf<String, Job>()
 
   init {
+    applyToken(hfToken.value)
     refreshDevice()
     refreshModels()
     loadChats()
@@ -287,7 +297,7 @@ class AppViewModel(private val app: NeuroForgeApp) : ViewModel() {
   // ---- chats ------------------------------------------------------------------------
 
   private val chatStore by lazy { ChatStore(app) }
-  private val browser by lazy { HfBrowser() }
+  private val browser by lazy { HfBrowser { hfToken.value.takeIf { t -> t.isNotBlank() } } }
   private var llm: LlmEngine? = null
   private var loadedLlmModelId: String? = null
   private var replyJob: Job? = null
@@ -524,6 +534,25 @@ class AppViewModel(private val app: NeuroForgeApp) : ViewModel() {
     prefs().edit().putString(KEY_POLICY, next.name).apply()
   }
 
+  fun setHfToken(next: String) {
+    val cleaned = next.trim()
+    hfToken.value = cleaned
+    prefs().edit().putString(KEY_HF_TOKEN, cleaned).apply()
+    applyToken(cleaned)
+  }
+
+  /**
+   * Hands the token to the downloader.
+   *
+   * Only the downloader: [browser] reads [hfToken] through a supplier instead, because
+   * this runs from `init` and `browser` is a lazy declared two hundred lines below. That
+   * shape — an initialiser reaching a property that has not been assigned yet — is exactly
+   * what crashed v1.1.0 on launch, and it compiles without a warning.
+   */
+  private fun applyToken(token: String) {
+    app.repository.accessToken = token.takeIf { it.isNotBlank() }
+  }
+
   /**
    * Resolved on each call rather than held in a field.
    *
@@ -561,6 +590,7 @@ class AppViewModel(private val app: NeuroForgeApp) : ViewModel() {
   companion object {
     private const val PREFS_NAME = "neuroforge"
     private const val KEY_POLICY = "accelerator_policy"
+    private const val KEY_HF_TOKEN = "hugging_face_token"
 
     /** Job key for the whole-pipeline download; not a model id, so it cannot collide. */
     private const val IMAGE_PIPELINE_JOB = "pipeline:text-to-4k"

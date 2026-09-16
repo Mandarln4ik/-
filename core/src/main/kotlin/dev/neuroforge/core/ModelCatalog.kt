@@ -96,12 +96,16 @@ sealed interface ModelSource {
    *   encoder and a VAE, and picking the wrong one is worse than reporting nothing found,
    *   because it fails later and somewhere else. Leave it empty in a single-model
    *   repository, where whatever is published is by definition the file wanted.
+   * @param gated true when the repository requires accepting a licence and an access token.
+   *   Worth stating in the catalogue rather than discovering as an HTTP 401 halfway through
+   *   a download: the remedy is a person visiting a web page, which no retry will achieve.
    */
   data class HuggingFace(
     val repoId: String,
     val path: String,
     val hints: List<String> = emptyList(),
     val requires: List<String> = emptyList(),
+    val gated: Boolean = false,
   ) : ModelSource {
     /**
      * The file extension to search for when [path] turns out not to exist.
@@ -157,6 +161,27 @@ fun chooseModelFile(
         .thenBy { it.first },
     )
     ?.first
+}
+
+/**
+ * Puts this device's SoC at the front of a file entry's ranking hints.
+ *
+ * Some repositories publish one bundle per accelerator — `..._mt6991.litertlm`,
+ * `..._sm8750.litertlm`, `..._Google_Tensor_G5.litertlm`. Those are graphs already compiled
+ * for one specific NPU, and on the matching phone one of them is worth more than any
+ * quantisation preference: it is the difference between a model that reaches the APU and
+ * one that falls back to the CPU. So the SoC outranks everything else when it is known.
+ *
+ * A repository with no per-SoC build is unaffected: an unmatched hint only fails to add to
+ * a candidate's score.
+ *
+ * @param socModel `Build.SOC_MODEL`, e.g. "MT6991". Blank, null and the "unknown" the
+ *   platform reports for a device that will not say are all ignored.
+ */
+fun hintsForDevice(declared: List<String>, socModel: String?): List<String> {
+  val soc = socModel?.trim()?.lowercase().orEmpty()
+  if (soc.isEmpty() || soc == "unknown" || soc in declared.map { it.lowercase() }) return declared
+  return listOf(soc) + declared
 }
 
 /**
@@ -439,10 +464,17 @@ object ModelCatalog {
    * of the same pieces. It also exposes `Backend.NPU`, so this is the one place where a
    * generative model really can reach the APU.
    *
-   * The file name here is a starting point, not a claim. `litert-community` renames and
-   * re-quantises these bundles, so the app resolves the real name from the repository
-   * listing when the declared one is gone, and CI runs that same resolution on every commit
-   * and prints what it landed on. That is how the four names before it got corrected.
+   * **This repository is gated.** CI found the file exactly where the catalogue says it is,
+   * and a download of it still answers 401: Google requires accepting the Gemma licence,
+   * which is a person visiting a web page and not something a retry can fix. So the app
+   * says that, and Settings takes a Hugging Face token for anyone who has accepted it.
+   *
+   * It stays in the catalogue because of what else the listing showed: this repository
+   * publishes per-SoC NPU builds — `..._mt6991.litertlm`, `..._sm8750.litertlm` and so on.
+   * Those are graphs already compiled for one accelerator, which is the closest thing to a
+   * real answer to "run the text model on the NPU" that exists today. The device's own SoC
+   * is added to the ranking hints at download time, so a phone reporting MT6991 gets the
+   * MT6991 build rather than the generic one.
    */
   val LLM_GEMMA3_1B = ModelSpec(
     id = "llm.gemma3_1b_it",
@@ -456,14 +488,18 @@ object ModelCatalog {
           repoId = "litert-community/Gemma3-1B-IT",
           path = "gemma3-1b-it-int4.litertlm",
           // Ranked, not required: an int4 build is the one worth having on an APU, but a
-          // repository that only publishes q8 still has exactly one usable file.
-          hints = listOf("int4", "q4", "ekv"),
+          // repository that only publishes q8 still has exactly one usable file. The
+          // device's SoC is prepended to this list at download time and outranks the rest,
+          // because a graph compiled for this exact accelerator beats a better recipe.
+          hints = listOf("int4", "q4", "ekv1280"),
+          gated = true,
         ),
         sizeBytes = 0L,
       )
     ),
-    notes = "Runs through LiteRT-LM, which supports an NPU backend — unlike the diffusion " +
-      "transformer, this one can genuinely reach the APU.",
+    notes = "Needs a Hugging Face token: Google gates this repository behind the Gemma " +
+      "licence. Add one in Settings after accepting it on the model page. In exchange it " +
+      "publishes per-SoC NPU builds — on a MediaTek MT6991 the app picks the MT6991 graph.",
   )
 
   val LLM_QWEN3_06B = ModelSpec(
@@ -473,16 +509,18 @@ object ModelCatalog {
     accelerators = listOf(Accel.NPU, Accel.GPU, Accel.CPU),
     files = listOf(
       ModelFile(
-        fileName = "qwen3_0_6b.litertlm",
+        fileName = "qwen3_0_6b_mixed_int4.litertlm",
         source = ModelSource.HuggingFace(
           repoId = "litert-community/Qwen3-0.6B",
-          path = "qwen3-0.6b-int4.litertlm",
-          hints = listOf("int4", "q4", "ekv"),
+          // Resolved from the repository listing by CI, not guessed.
+          path = "qwen3_0_6b_mixed_int4.litertlm",
+          hints = listOf("int4", "q4"),
         ),
         sizeBytes = 0L,
       )
     ),
-    notes = "The smaller of the two; a better first try if memory is tight.",
+    notes = "The smaller of the two, ungated, and 475 MiB — a better first try if memory " +
+      "is tight or you would rather not sign anything.",
   )
 
   /** Everything, for the model-manager screen. */

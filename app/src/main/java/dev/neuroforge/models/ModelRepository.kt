@@ -5,6 +5,7 @@ import android.util.Log
 import dev.neuroforge.core.ModelFile
 import dev.neuroforge.core.ModelSource
 import dev.neuroforge.core.chooseModelFile
+import dev.neuroforge.core.hintsForDevice
 import dev.neuroforge.core.ModelSpec
 import dev.neuroforge.core.Provenance
 import dev.neuroforge.core.Tar
@@ -68,6 +69,29 @@ data class DownloadProgress(
 class ModelRepository(private val context: Context) {
 
   private val root: File = File(context.filesDir, "models").apply { mkdirs() }
+
+  /**
+   * Hugging Face access token, or null.
+   *
+   * Some repositories are gated behind a licence the user has to accept in a browser —
+   * Google's Gemma terms, for one. No amount of retrying gets past that; a token from
+   * someone who has accepted it does. Held here rather than baked in for the obvious
+   * reason, and never logged.
+   */
+  @Volatile var accessToken: String? = null
+
+  /**
+   * This device's SoC, lowercased, or null.
+   *
+   * Used to rank a repository's per-accelerator builds. Read once: it cannot change while
+   * the process is alive.
+   */
+  private val socModel: String? = runCatching { android.os.Build.SOC_MODEL }.getOrNull()
+
+  /** Adds the access token when there is one. */
+  private fun Request.Builder.authorized(): Request.Builder = apply {
+    accessToken?.takeIf { it.isNotBlank() }?.let { header("Authorization", "Bearer $it") }
+  }
 
   private val http: OkHttpClient by lazy {
     OkHttpClient.Builder()
@@ -135,13 +159,11 @@ class ModelRepository(private val context: Context) {
 
     val digest = MessageDigest.getInstance("SHA-256")
     val url = resolveUrl(file)
-    val request = Request.Builder().url(url).build()
+    val request = Request.Builder().url(url).authorized().build()
 
     http.newCall(request).execute().use { response ->
       if (!response.isSuccessful) {
-        throw IOException(
-          "HTTP ${response.code} fetching ${file.fileName} from ${file.originLabel()}"
-        )
+        throw IOException(describeFailure(response.code, file))
       }
       val body = response.body ?: throw IOException("empty body for ${file.fileName}")
       val total = body.contentLength().takeIf { it > 0 } ?: file.sizeBytes
@@ -245,8 +267,12 @@ class ModelRepository(private val context: Context) {
     // Search for the extension this entry actually has. Defaulting to `.tflite` here meant
     // a renamed `.litertlm` bundle or a moved `tokenizer.json` was fetched, listed, and
     // then filtered down to nothing.
+    // The device's own SoC outranks the catalogue's hints: a repository that publishes one
+    // bundle per accelerator has a build compiled for this exact NPU, and that is worth
+    // more than any quantisation preference.
+    val ranked = hintsForDevice(source.hints, socModel)
     val chosen =
-      chooseModelFile(available, source.path, source.hints, source.extension, source.requires)
+      chooseModelFile(available, source.path, ranked, source.extension, source.requires)
       ?: throw IOException(
         "'${source.path}' was not found in ${source.repoId}. It contains: " +
           available.joinToString(", ").take(400)
@@ -264,8 +290,36 @@ class ModelRepository(private val context: Context) {
    * trigger a pointless listing and a misleading error.
    */
   private fun headOk(url: String): Boolean = runCatching {
-    http.newCall(Request.Builder().url(url).head().build()).execute().use { it.isSuccessful }
+    http.newCall(Request.Builder().url(url).head().authorized().build())
+      .execute().use { it.isSuccessful }
   }.getOrDefault(true)
+
+  /**
+   * Turns an HTTP status into something the person holding the phone can act on.
+   *
+   * A gated repository answers 401 or 403, and the remedy is not a retry — it is visiting
+   * the model page, accepting the licence, and pasting a token into Settings. Reporting
+   * that as "HTTP 401" leaves someone pressing Download again.
+   */
+  private fun describeFailure(code: Int, file: ModelFile): String {
+    val source = file.source
+    val gated = source is ModelSource.HuggingFace && source.gated
+    return when {
+      code == 401 || code == 403 -> buildString {
+        append("${file.originLabel()} refused the download (HTTP $code). ")
+        if (gated) {
+          append("This repository is gated: open its page on Hugging Face, accept the ")
+          append("licence, then paste an access token into Settings.")
+        } else if (accessToken.isNullOrBlank()) {
+          append("It may need a Hugging Face access token — Settings has a field for one.")
+        } else {
+          append("The token in Settings does not grant access to it.")
+        }
+      }
+      code == 404 -> "${file.fileName} is no longer in ${file.originLabel()} (HTTP 404)."
+      else -> "HTTP $code fetching ${file.fileName} from ${file.originLabel()}"
+    }
+  }
 
   /**
    * Every file path in a Hugging Face model repository, subdirectories included.
@@ -275,7 +329,7 @@ class ModelRepository(private val context: Context) {
    */
   private fun listHuggingFaceFiles(repoId: String): List<String> = runCatching {
     val url = "${ModelFile.HF_ENDPOINT}/api/models/$repoId/tree/main?recursive=true"
-    http.newCall(Request.Builder().url(url).build()).execute().use { response ->
+    http.newCall(Request.Builder().url(url).authorized().build()).execute().use { response ->
       if (!response.isSuccessful) return emptyList()
       val body = response.body?.string().orEmpty()
       val array = JSONArray(body)

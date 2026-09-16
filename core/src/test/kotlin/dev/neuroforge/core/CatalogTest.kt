@@ -265,6 +265,54 @@ class CatalogTest {
     assertEquals("2.1 GiB", formatBytes(2_265_524_224L))
   }
 
+  @Test
+  fun `the device SoC outranks every other hint`() {
+    // litert-community publishes one bundle per accelerator. On a phone reporting MT6991
+    // the MT6991 graph is worth more than a better quantisation recipe, because it is the
+    // one that was compiled for this APU.
+    val listing = listOf(
+      "Gemma3-1B-IT_q4_ekv1280_mt6989.litertlm",
+      "Gemma3-1B-IT_q4_ekv1280_mt6991.litertlm",
+      "Gemma3-1B-IT_q4_ekv1280_sm8750.litertlm",
+      "gemma3-1b-it-int4.litertlm",
+    )
+    val hints = hintsForDevice(listOf("int4", "q4", "ekv1280"), "MT6991")
+    assertEquals("mt6991", hints.first())
+    assertEquals(
+      "Gemma3-1B-IT_q4_ekv1280_mt6991.litertlm",
+      chooseModelFile(listing, "not-published-any-more.litertlm", hints, ".litertlm"),
+    )
+  }
+
+  @Test
+  fun `an unknown SoC leaves the hints alone`() {
+    val declared = listOf("int4", "q4")
+    assertEquals(declared, hintsForDevice(declared, null))
+    assertEquals(declared, hintsForDevice(declared, ""))
+    assertEquals(declared, hintsForDevice(declared, "unknown"))
+    assertEquals(declared, hintsForDevice(declared, "  UNKNOWN "))
+  }
+
+  @Test
+  fun `a SoC with no matching build changes nothing`() {
+    // An unmatched hint only fails to add to a score, so a repository that publishes one
+    // generic bundle behaves exactly as before.
+    val listing = listOf("qwen3_0_6b_mixed_int4.litertlm", "qwen3_0_6b_f32.litertlm")
+    val hints = hintsForDevice(listOf("int4"), "MT6991")
+    assertEquals(
+      "qwen3_0_6b_mixed_int4.litertlm",
+      chooseModelFile(listing, "gone.litertlm", hints, ".litertlm"),
+    )
+  }
+
+  @Test
+  fun `a gated repository is marked as such rather than discovered as a 401`() {
+    val gemma = ModelCatalog.LLM_GEMMA3_1B.files.single().source as ModelSource.HuggingFace
+    assertTrue(gemma.gated, "the Gemma repository requires accepting Google's licence")
+    val qwen = ModelCatalog.LLM_QWEN3_06B.files.single().source as ModelSource.HuggingFace
+    assertTrue(!qwen.gated)
+  }
+
   private fun assertContentEqualsInt(expected: IntArray, actual: IntArray) {
     assertEquals(expected.toList(), actual.toList())
   }

@@ -24,7 +24,7 @@ data class RepoFile(val path: String, val sizeBytes: Long) {
  * guess. Letting someone point at a repository and see its real contents removes the
  * guesser from the loop entirely — which is a better fix than guessing more carefully.
  */
-class HfBrowser {
+class HfBrowser(private val accessToken: () -> String? = { null }) {
 
   private val http = OkHttpClient.Builder()
     .connectTimeout(20, TimeUnit.SECONDS)
@@ -45,9 +45,20 @@ class HfBrowser {
     }
 
     val url = "https://huggingface.co/api/models/$clean/tree/main?recursive=true"
-    http.newCall(Request.Builder().url(url).build()).execute().use { response ->
+    // A supplier rather than a field: the token is owned by the view model, and copying it
+    // in at construction would mean a token pasted afterwards never reached the browser.
+    val request = Request.Builder().url(url).apply {
+      accessToken()?.takeIf { it.isNotBlank() }?.let { header("Authorization", "Bearer $it") }
+    }.build()
+    http.newCall(request).execute().use { response ->
       if (response.code == 404) {
         throw IOException("No repository '$clean' — check the spelling, or it may be private.")
+      }
+      if (response.code == 401 || response.code == 403) {
+        throw IOException(
+          "'$clean' is gated or private (HTTP ${response.code}). Accept its licence on " +
+            "Hugging Face and paste an access token into Settings."
+        )
       }
       if (!response.isSuccessful) {
         throw IOException("HTTP ${response.code} listing '$clean'")
