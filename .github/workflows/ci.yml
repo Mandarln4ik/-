@@ -88,9 +88,9 @@ jobs:
   smoke:
     name: App launches on an emulator
     runs-on: ubuntu-latest
-    # The check that would have caught the v1.1.0 launch crash. An initialiser-order fault
+    # Catches launch crashes of the kind that shipped in v1.1.0: an initialiser-order fault
     # compiles without a warning, so assembling the APK proves nothing about whether it
-    # opens; only starting it does.
+    # opens. Only starting it does.
     steps:
       - uses: actions/checkout@v4
 
@@ -129,26 +129,6 @@ jobs:
           force-avd-creation: false
           emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
           disable-animations: true
-          # Plain `sh`, not bash: the action runs this script with /usr/bin/sh, so `set -o
-          # pipefail` is a syntax error that fails the step before the app is ever installed
-          # - which looked exactly like a launch crash in the log.
-          script: |
-            set -u
-            adb install -r app/build/outputs/apk/debug/app-debug.apk
-            adb logcat -c
-            adb shell am start -W -n dev.neuroforge/.MainActivity
-            sleep 12
-
-            # Two independent signals, because either alone lies: a crash dialog can be
-            # dismissed leaving the process alive, and a process can die silently.
-            if adb logcat -d | grep -E "FATAL EXCEPTION|AndroidRuntime.*dev\.neuroforge"; then
-              echo "::error::The app crashed on launch"
-              adb logcat -d | grep -A 40 "FATAL EXCEPTION" | head -60
-              exit 1
-            fi
-            if [ -z "$(adb shell pidof dev.neuroforge)" ]; then
-              echo "::error::The app is not running 12s after launch"
-              adb logcat -d | tail -80
-              exit 1
-            fi
-            echo "app is alive"
+          # One line on purpose: this action runs the script a line at a time, each in its
+          # own `sh -c`, so anything with a multi-line construct in it is a syntax error.
+          script: bash ./.github/scripts/smoke.sh
