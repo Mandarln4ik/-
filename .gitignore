@@ -19,3 +19,7 @@ local.properties
 
 # Vendor NPU runtimes are not redistributable; see docs/NPU_RUNTIME.md
 app/src/main/jniLibs/arm64-v8a/*.so
+
+# Python bytecode from the on-device conversion scripts
+__pycache__/
+*.pyc
