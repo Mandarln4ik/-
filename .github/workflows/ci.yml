@@ -88,6 +88,10 @@ jobs:
   smoke:
     name: App launches on an emulator
     runs-on: ubuntu-latest
+    # A hung check is indistinguishable from a slow one, and this one has hung: the emulator
+    # step normally takes about two minutes and was still going after thirty. Without a
+    # bound it would sit there for the six-hour default.
+    timeout-minutes: 25
     # Catches launch crashes of the kind that shipped in v1.1.0: an initialiser-order fault
     # compiles without a warning, so assembling the APK proves nothing about whether it
     # opens. Only starting it does.
@@ -126,7 +130,12 @@ jobs:
           api-level: 34
           target: google_apis
           arch: x86_64
-          force-avd-creation: false
+          # Build the AVD rather than restoring one. The cached `default_boot` snapshot is
+          # shared across runs and is written at shutdown, so a run cancelled mid-save
+          # leaves a snapshot the emulator then cannot load - and the action's boot wait has
+          # no way to tell that from a slow boot.
+          force-avd-creation: true
+          emulator-boot-timeout: 600
           emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
           disable-animations: true
           # One line on purpose: this action runs the script a line at a time, each in its
