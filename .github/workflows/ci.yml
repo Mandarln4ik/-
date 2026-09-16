@@ -5,6 +5,13 @@ on:
     branches: ["**"]
   pull_request:
 
+# A branch with an open PR fires this twice per push, and both copies queue an emulator.
+# Superseded runs are not worth a runner: only the newest commit's result means anything,
+# and the contention made a two-minute build take forty.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   core:
     name: Core tests (no Android SDK)
