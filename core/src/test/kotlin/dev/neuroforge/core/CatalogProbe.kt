@@ -198,7 +198,14 @@ private fun chatTemplate() {
     println("(not found in tokenizer_config.json or a chat_template.jinja)")
   } else {
     println("source: ${if (fromJinja != null) "chat_template.jinja" else "tokenizer_config.json"}")
-    println(template.take(2500))
+    // The head shows how a user turn is framed; the `add_generation_prompt` block is what
+    // decides the tail this app appends, and it is at the very end of a long template — so
+    // printing the first N characters shows everything except the part being verified.
+    println("--- how a user turn is framed ---")
+    println(template.lineSequence().filter { it.contains("im_start") }.take(4).joinToString("\n"))
+    println("--- add_generation_prompt ---")
+    val at = template.indexOf("add_generation_prompt")
+    println(if (at >= 0) template.substring(at).take(900) else "(not in the template)")
   }
 
   println()
