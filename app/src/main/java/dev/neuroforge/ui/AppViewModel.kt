@@ -107,6 +107,24 @@ class AppViewModel(private val app: NeuroForgeApp) : ViewModel() {
   private var generationJob: Job? = null
   private val downloadJobs = mutableMapOf<String, Job>()
 
+  /**
+   * Collaborators, declared above [init] — deliberately, and this is load-bearing.
+   *
+   * `viewModelScope` runs on `Dispatchers.Main.immediate`, so a `launch` from `init` on the
+   * main thread does **not** defer: the body executes synchronously up to its first
+   * suspension point. `loadChats()` reaches [chatStore] before `load()` can suspend, and if
+   * the delegate for a `by lazy` further down the file has not been assigned yet, that read
+   * is a NullPointerException on a null `Lazy` — the crash v1.1.0 shipped with, in the same
+   * class, from the same cause.
+   *
+   * Kotlin assigns property initialisers in declaration order and gives no warning when one
+   * runs early. So anything an `init` path can touch belongs here, above it.
+   */
+  private val chatStore by lazy { ChatStore(app) }
+
+  /** Reads the token through a supplier rather than copying it, so a later paste reaches it. */
+  private val browser by lazy { HfBrowser { hfToken.value.takeIf { t -> t.isNotBlank() } } }
+
   init {
     applyToken(hfToken.value)
     refreshDevice()
@@ -299,8 +317,6 @@ class AppViewModel(private val app: NeuroForgeApp) : ViewModel() {
 
   // ---- chats ------------------------------------------------------------------------
 
-  private val chatStore by lazy { ChatStore(app) }
-  private val browser by lazy { HfBrowser { hfToken.value.takeIf { t -> t.isNotBlank() } } }
   private var llm: LlmEngine? = null
   private var loadedLlmModelId: String? = null
   private var replyJob: Job? = null
