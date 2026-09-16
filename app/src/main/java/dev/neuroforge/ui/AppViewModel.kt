@@ -8,6 +8,7 @@ import androidx.lifecycle.viewmodel.initializer
 import androidx.lifecycle.viewmodel.viewModelFactory
 import dev.neuroforge.NeuroForgeApp
 import dev.neuroforge.core.Accel
+import dev.neuroforge.core.Bonsai
 import dev.neuroforge.core.AcceleratorPolicy
 import dev.neuroforge.core.Chat
 import dev.neuroforge.core.ChatKind
@@ -79,7 +80,9 @@ class AppViewModel(private val app: NeuroForgeApp) : ViewModel() {
   // into the same object would recompose the device panel and the model list too.
   val prompt = MutableStateFlow("a red fox sitting in fresh snow at sunrise, cinematic light")
   val seed = MutableStateFlow(7L)
-  val steps = MutableStateFlow(4)
+  // The count the model was step-distilled for. Named rather than typed so the UI default
+  // and the pipeline default cannot drift apart.
+  val steps = MutableStateFlow(Bonsai.DEFAULT_STEPS)
   val target = MutableStateFlow(OutputTarget.SQUARE_4K)
   val strategy = MutableStateFlow(UpscaleStrategy.FAST)
 
