@@ -7,6 +7,7 @@ import androidx.lifecycle.viewModelScope
 import androidx.lifecycle.viewmodel.initializer
 import androidx.lifecycle.viewmodel.viewModelFactory
 import dev.neuroforge.NeuroForgeApp
+import dev.neuroforge.core.Accel
 import dev.neuroforge.core.AcceleratorPolicy
 import dev.neuroforge.core.Chat
 import dev.neuroforge.core.ChatKind
@@ -162,6 +163,43 @@ class AppViewModel(private val app: NeuroForgeApp) : ViewModel() {
           it.copy(downloads = it.downloads - spec.id, error = "${spec.displayName}: ${e.message}")
         }
       }
+    }
+  }
+
+  /**
+   * Downloads every graph a text-to-4K run needs, one after another.
+   *
+   * Four separate buttons for one capability is a quiz about which four; this is the answer.
+   * Sequential rather than parallel because the four together are about four gigabytes, and
+   * four concurrent streams on a phone connection finish later than four consecutive ones
+   * while making the progress bar useless.
+   */
+  fun downloadImagePipeline() {
+    if (downloadJobs[IMAGE_PIPELINE_JOB]?.isActive == true) return
+    downloadJobs[IMAGE_PIPELINE_JOB] = viewModelScope.launch {
+      for (spec in ModelCatalog.textTo4kPipeline) {
+        if (app.repository.isReady(spec)) continue
+        try {
+          spec.files.forEachIndexed { index, file ->
+            app.repository.download(spec, file).collect { progress ->
+              val labelled = progress.copy(
+                fileName = "${file.fileName} (${index + 1}/${spec.files.size})"
+              )
+              _state.update { it.copy(downloads = it.downloads + (spec.id to labelled)) }
+            }
+          }
+          _state.update { it.copy(downloads = it.downloads - spec.id) }
+          refreshModels()
+        } catch (e: Throwable) {
+          _state.update {
+            it.copy(downloads = it.downloads - spec.id, error = "${spec.displayName}: ${e.message}")
+          }
+          // One missing graph makes the pipeline unusable, so there is nothing to gain by
+          // downloading the rest; stopping here also leaves the error on screen.
+          break
+        }
+      }
+      downloadJobs.remove(IMAGE_PIPELINE_JOB)
     }
   }
 
@@ -523,6 +561,9 @@ class AppViewModel(private val app: NeuroForgeApp) : ViewModel() {
   companion object {
     private const val PREFS_NAME = "neuroforge"
     private const val KEY_POLICY = "accelerator_policy"
+
+    /** Job key for the whole-pipeline download; not a model id, so it cannot collide. */
+    private const val IMAGE_PIPELINE_JOB = "pipeline:text-to-4k"
 
     fun factory(app: NeuroForgeApp) = viewModelFactory {
       initializer { AppViewModel(app) }

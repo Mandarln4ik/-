@@ -52,20 +52,40 @@ sealed interface Scheduler {
 }
 
 /**
+ * The time-shift a FLUX.2-klein schedule uses, as its reference implementation computes it.
+ *
+ * The shift is not a taste knob on these models: it is derived from how many tokens the
+ * image occupies and how many steps are being taken, by interpolating two empirical fits
+ * (at 200 and 10 steps) and exponentiating. Hardcoding a plausible value instead — this
+ * code used 3.0 — puts every sigma in the schedule slightly wrong, which shows up as an
+ * image that is soft and badly composed rather than as an error.
+ *
+ * Mirrors `flowmatch_sigmas` in the model's own `generate.py`, which in turn mirrors
+ * `compute_empirical_mu` in diffusers.
+ */
+fun empiricalShift(tokens: Int, steps: Int): Float {
+  val m200 = 0.00016927 * tokens + 0.45666666
+  val m10 = 8.73809524e-05 * tokens + 1.89833333
+  val a = (m200 - m10) / 190.0
+  val mu = a * steps + (m200 - 200.0 * a)
+  return kotlin.math.exp(mu).toFloat()
+}
+
+/**
  * Flow-matching Euler sampler — the one FLUX-family and SD3-family models are trained for,
  * and the one [dev.neuroforge.core.ModelCatalog.BONSAI_IMAGE_4B] needs.
  *
  * The model predicts a velocity `v`, and the update is a plain Euler step along it:
  * `x ← x + (σ_next − σ) · v`. The schedule is a linear ramp in sigma from 1 down to
- * `1/numTrainTimesteps`, bent by [shift]: larger shift spends more of the budget at high
- * noise, which is what lets a 4-step schedule still resolve global structure.
+ * `1/steps`, bent by [shift]: larger shift spends more of the budget at high noise, which
+ * is what lets a 4-step schedule still resolve global structure.
  *
- * Mirrors `FlowMatchEulerDiscreteScheduler` from HuggingFace diffusers.
+ * Mirrors `FlowMatchEulerDiscreteScheduler` from HuggingFace diffusers, in the form the
+ * Bonsai reference host loop uses it.
  */
 class FlowMatchEulerScheduler(
   numInferenceSteps: Int,
-  private val shift: Float = 3.0f,
-  numTrainTimesteps: Int = 1000,
+  private val shift: Float,
 ) : Scheduler {
 
   /** `sigmas[i]` for each step, with a trailing 0 so the last step lands on a clean latent. */
@@ -76,21 +96,27 @@ class FlowMatchEulerScheduler(
 
   init {
     require(numInferenceSteps > 0) { "numInferenceSteps must be positive, was $numInferenceSteps" }
-    val sigmaMax = 1.0f
-    val sigmaMin = 1.0f / numTrainTimesteps
+    // `np.linspace(1.0, 1.0 / steps, steps)`. The lower endpoint is 1/steps — it moves with
+    // the step count and is not the 1/numTrainTimesteps the SD-family schedulers use. With
+    // the SD convention a 4-step run would start its ramp at 0.001 instead of 0.25 and
+    // spend three of its four steps at essentially the same noise level.
     val raw = FloatArray(numInferenceSteps) { i ->
-      // linspace(sigmaMax, sigmaMin, n); a single step degenerates to sigmaMax.
-      if (numInferenceSteps == 1) sigmaMax
-      else sigmaMax + (sigmaMin - sigmaMax) * i / (numInferenceSteps - 1).toFloat()
+      val lo = 1.0f / numInferenceSteps
+      if (numInferenceSteps == 1) 1.0f
+      else 1.0f + (lo - 1.0f) * i / (numInferenceSteps - 1).toFloat()
     }
     sigmas = FloatArray(numInferenceSteps + 1)
     for (i in raw.indices) {
+      // `exp(mu) / (exp(mu) + (1/s - 1))`, spelled without the reciprocal so s = 0 is safe.
       val s = raw[i]
       sigmas[i] = shift * s / (1.0f + (shift - 1.0f) * s)
     }
     sigmas[numInferenceSteps] = 0.0f
     steps = (0 until numInferenceSteps).map { i ->
-      DiffusionStep(index = i, timestep = sigmas[i] * numTrainTimesteps, sigma = sigmas[i])
+      // The reference implementation states it outright: "timestep == sigma". Multiplying
+      // by numTrainTimesteps, as the SD-family convention would, feeds the graph a number
+      // three orders of magnitude off.
+      DiffusionStep(index = i, timestep = sigmas[i], sigma = sigmas[i])
     }
   }
 
@@ -100,6 +126,17 @@ class FlowMatchEulerScheduler(
     }
     val dt = sigmas[stepIndex + 1] - sigmas[stepIndex]
     for (i in latents.indices) latents[i] += dt * modelOutput[i]
+  }
+
+  companion object {
+    /**
+     * The schedule for an image of [tokens] tokens run for [steps] steps.
+     *
+     * Preferred over the constructor: the shift is a function of the geometry, not a taste
+     * knob, and every caller that picked its own number picked it wrong.
+     */
+    fun forImage(tokens: Int, steps: Int): FlowMatchEulerScheduler =
+      FlowMatchEulerScheduler(steps, empiricalShift(tokens, steps))
   }
 }
 

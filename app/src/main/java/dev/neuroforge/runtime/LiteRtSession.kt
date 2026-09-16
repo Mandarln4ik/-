@@ -67,8 +67,30 @@ class LiteRtSession private constructor(
   private val inputs: List<TensorBuffer> = model.createInputBuffers()
   private val outputs: List<TensorBuffer> = model.createOutputBuffers()
 
+  /**
+   * How many elements each input tensor holds, read once at construction.
+   *
+   * Declared here, above its first use, rather than next to the accessor: a property
+   * initialiser that runs before the field it reads has been assigned is a launch crash
+   * with no compile-time warning, and this app has already shipped one of those.
+   *
+   * It exists so a multi-input graph can be wired by *what each buffer holds* rather than
+   * by trusting the order the buffers come back in. The reference host loop for these
+   * graphs opens with a warning about exactly this: the runtime hands input details back in
+   * tensor order, not in the order the model's `forward()` declared them, and a pipeline
+   * that assumes otherwise feeds the position ids where the prompt embeddings go. That does
+   * not fail — every shape is plausible — it returns noise. Reading a freshly created
+   * buffer is the cheapest way to ask; it is zero-filled and its length is the declared one.
+   */
+  private val inputSizes: IntArray = IntArray(inputs.size) { i ->
+    runCatching { inputs[i].readFloat().size }.getOrElse { -1 }
+  }
+
   val inputCount: Int get() = inputs.size
   val outputCount: Int get() = outputs.size
+
+  /** Elements in input tensor [index], or -1 when the graph declares it as a non-float type. */
+  fun inputElementCount(index: Int): Int = inputSizes[index]
 
   /** Writes float data into input tensor [index]. */
   fun writeInput(index: Int, data: FloatArray) {

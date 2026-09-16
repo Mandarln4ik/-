@@ -24,7 +24,21 @@ class BpeTokenizer(
   private val vocab: Map<String, Int>,
   merges: List<Pair<String, String>>,
   private val unkId: Int? = null,
+  specialTokens: Map<String, Int> = emptyMap(),
 ) {
+
+  /**
+   * Added tokens, longest first.
+   *
+   * These are matched literally before any BPE runs, because they are ids the model was
+   * given directly rather than text it was asked to segment. Without this step a chat
+   * marker like `<|im_start|>` is byte-pair-encoded into half a dozen ordinary pieces, and
+   * the encoder reads a conversation frame as literal punctuation — which changes the
+   * meaning of the whole prompt and never raises an error. Longest-first because
+   * `<|im_start|>` must not be shadowed by a shorter entry that happens to be a prefix.
+   */
+  private val specials: List<Pair<String, Int>> =
+    specialTokens.entries.sortedByDescending { it.key.length }.map { it.key to it.value }
 
   private val ranks: Map<Pair<String, String>, Int> =
     merges.withIndex().associate { (i, pair) -> pair to i }
@@ -34,8 +48,32 @@ class BpeTokenizer(
 
   val vocabSize: Int get() = vocab.size
 
-  /** Encodes [text] to token ids. */
+  /** Encodes [text] to token ids, passing any added token straight through as its own id. */
   fun encode(text: String): IntArray {
+    if (specials.isEmpty()) return encodeOrdinary(text)
+    val ids = ArrayList<Int>()
+    var at = 0
+    while (at < text.length) {
+      val hit = specials.firstNotNullOfOrNull { (literal, id) ->
+        if (text.startsWith(literal, at)) literal to id else null
+      }
+      if (hit != null) {
+        ids.add(hit.second)
+        at += hit.first.length
+        continue
+      }
+      // Run of ordinary text up to the next added token, encoded in one go so merges are
+      // not cut short at an arbitrary character boundary.
+      val next = specials.mapNotNull { (literal, _) ->
+        text.indexOf(literal, at).takeIf { it >= 0 }
+      }.minOrNull() ?: text.length
+      encodeOrdinary(text.substring(at, next)).forEach { ids.add(it) }
+      at = next
+    }
+    return ids.toIntArray()
+  }
+
+  private fun encodeOrdinary(text: String): IntArray {
     val ids = ArrayList<Int>()
     for (word in preTokenize(text)) {
       val mapped = word.toByteArray(Charsets.UTF_8)
@@ -136,12 +174,17 @@ class BpeTokenizer(
      *
      * @param mergeLines each entry is `"left right"`, as stored in the file.
      */
-    fun from(vocab: Map<String, Int>, mergeLines: List<String>, unkId: Int? = null): BpeTokenizer {
+    fun from(
+      vocab: Map<String, Int>,
+      mergeLines: List<String>,
+      unkId: Int? = null,
+      specialTokens: Map<String, Int> = emptyMap(),
+    ): BpeTokenizer {
       val merges = mergeLines.mapNotNull { line ->
         val parts = line.trim().split(' ')
         if (parts.size == 2) parts[0] to parts[1] else null
       }
-      return BpeTokenizer(vocab, merges, unkId)
+      return BpeTokenizer(vocab, merges, unkId, specialTokens)
     }
   }
 }

@@ -242,7 +242,11 @@ class ModelRepository(private val context: Context) {
           "be listed. Check the model page, or side-load the file."
       )
     }
-    val chosen = chooseModelFile(available, source.path, source.hints)
+    // Search for the extension this entry actually has. Defaulting to `.tflite` here meant
+    // a renamed `.litertlm` bundle or a moved `tokenizer.json` was fetched, listed, and
+    // then filtered down to nothing.
+    val chosen =
+      chooseModelFile(available, source.path, source.hints, source.extension, source.requires)
       ?: throw IOException(
         "'${source.path}' was not found in ${source.repoId}. It contains: " +
           available.joinToString(", ").take(400)
@@ -263,9 +267,14 @@ class ModelRepository(private val context: Context) {
     http.newCall(Request.Builder().url(url).head().build()).execute().use { it.isSuccessful }
   }.getOrDefault(true)
 
-  /** File paths at the root of a Hugging Face model repository. */
+  /**
+   * Every file path in a Hugging Face model repository, subdirectories included.
+   *
+   * Recursive because the tokenizer these pipelines need sits in a `tokenizer/` directory,
+   * and a root-only listing reports the repository as not containing it.
+   */
   private fun listHuggingFaceFiles(repoId: String): List<String> = runCatching {
-    val url = "${ModelFile.HF_ENDPOINT}/api/models/$repoId/tree/main"
+    val url = "${ModelFile.HF_ENDPOINT}/api/models/$repoId/tree/main?recursive=true"
     http.newCall(Request.Builder().url(url).build()).execute().use { response ->
       if (!response.isSuccessful) return emptyList()
       val body = response.body?.string().orEmpty()

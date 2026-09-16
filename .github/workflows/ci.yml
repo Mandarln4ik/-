@@ -77,49 +77,13 @@ jobs:
       - uses: gradle/actions/setup-gradle@v4
 
       # A catalogue entry is a claim about someone else's repository. The authoring
-      # environment cannot reach Hugging Face, so that claim went untested twice and both
-      # times failed on a real phone. CI can reach it, so the check lives here.
-      - name: Probe every catalogued download
+      # environment cannot reach Hugging Face, so that claim went untested three times and
+      # every time it failed on a real phone. CI can reach it, so the check lives here — and
+      # it runs the same resolution the device runs, rather than a stricter one that would
+      # fail entries which actually work.
+      - name: Resolve every catalogued download
         working-directory: core
-        run: |
-          set -uo pipefail
-          ./gradlew --quiet --console=plain dumpCatalog > /tmp/catalog.tsv
-          echo "checking $(wc -l < /tmp/catalog.tsv) files"
-          failed=0
-          while IFS=$'\t' read -r id file url repo; do
-            [ -z "$url" ] && continue
-            code=$(curl -sIL -o /dev/null -w '%{http_code}' --max-time 45 "$url" || echo 000)
-            size=$(curl -sIL -o /dev/null -w '%{size_download}' --max-time 45 "$url" || echo 0)
-            if [ "$code" = "200" ]; then
-              echo "ok    $id  $file  (HTTP $code)"
-            else
-              echo "FAIL  $id  $file  (HTTP $code)  $url"
-              failed=1
-              if [ -n "$repo" ]; then
-                echo "      files actually in $repo (recursive):"
-                curl -s --max-time 45 \
-                  "https://huggingface.co/api/models/$repo/tree/main?recursive=true" \
-                  | tr ',' '\n' | grep -o '"path":"[^"]*"' | sed 's/"path":"/        /; s/"$//' \
-                  || echo "        (listing failed)"
-              fi
-            fi
-          done < /tmp/catalog.tsv
-
-          # The reference host loop and its metadata describe the tensor contract this app
-          # has so far been inferring. Printing them here turns the pipeline's shapes into
-          # something read rather than assumed.
-          echo
-          echo "=== Bonsai pipeline_meta.json ==="
-          curl -sL --max-time 45 \
-            "https://huggingface.co/litert-community/Bonsai-Image-ternary-4B/resolve/main/pipeline_meta.json" \
-            | head -c 4000 || echo "(unavailable)"
-          echo
-          echo "=== Bonsai generate.py (reference implementation) ==="
-          curl -sL --max-time 45 \
-            "https://huggingface.co/litert-community/Bonsai-Image-ternary-4B/resolve/main/generate.py" \
-            | head -200 || echo "(unavailable)"
-
-          exit $failed
+        run: ./gradlew --quiet --console=plain probeCatalog
 
   smoke:
     name: App launches on an emulator

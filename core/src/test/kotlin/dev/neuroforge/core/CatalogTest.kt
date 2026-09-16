@@ -200,10 +200,52 @@ class CatalogTest {
   }
 
   @Test
-  fun `nothing matching the hints returns null rather than a wrong file`() {
+  fun `a required substring excludes a different model in the same repository`() {
     // Downloading the wrong graph is worse than failing: it fails later, inside the loader.
+    // The Bonsai release is one repository holding a DiT, a text encoder and a VAE.
+    val files = listOf("dit_int4b32.tflite", "textenc_int4.tflite", "vae_dec_fp32.tflite")
+    assertEquals(
+      "textenc_int4.tflite",
+      chooseModelFile(files, "renamed.tflite", hints = listOf("int4"), requires = listOf("textenc")),
+    )
+    assertNull(
+      chooseModelFile(files, "renamed.tflite", hints = emptyList(), requires = listOf("unet")),
+    )
+  }
+
+  @Test
+  fun `a hint that nothing matches still yields the one usable file`() {
+    // The opposite failure: a repository publishing only a q8 build when the hint asks for
+    // int4 has exactly one file worth downloading, and "not found" would be wrong.
     val files = listOf("model_fp32.tflite")
-    assertNull(chooseModelFile(files, "model_int8.tflite", listOf("int8")))
+    assertEquals("model_fp32.tflite", chooseModelFile(files, "model_int8.tflite", listOf("int8")))
+  }
+
+  @Test
+  fun `the extension searched for follows the entry's own path`() {
+    // Defaulting this to .tflite meant a renamed .litertlm bundle was listed and then
+    // filtered down to nothing, which reads as "the repository is empty".
+    val source = ModelSource.HuggingFace("owner/repo", "qwen3-0.6b-int4.litertlm")
+    assertEquals(".litertlm", source.extension)
+    assertEquals(".json", ModelSource.HuggingFace("o/r", "tokenizer/tokenizer.json").extension)
+    assertEquals(".tflite", ModelSource.HuggingFace("o/r", "noextension").extension)
+
+    val listing = listOf("Qwen3-0.6B_seq128_q8_ekv1280.litertlm", "README.md")
+    assertEquals(
+      "Qwen3-0.6B_seq128_q8_ekv1280.litertlm",
+      chooseModelFile(listing, source.path, listOf("int4"), source.extension),
+    )
+  }
+
+  @Test
+  fun `a subdirectory path resolves against a recursive listing`() {
+    val listing = listOf("pipeline_meta.json", "tokenizer/tokenizer.json", "tokenizer/vocab.json")
+    assertEquals(
+      "tokenizer/tokenizer.json",
+      chooseModelFile(
+        listing, "tokenizer/tokenizer.json", emptyList(), ".json", listOf("tokenizer.json"),
+      ),
+    )
   }
 
   @Test

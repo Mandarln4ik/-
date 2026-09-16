@@ -32,6 +32,36 @@ fun ModelsScreen(vm: AppViewModel, state: UiState) {
           style = MaterialTheme.typography.bodySmall,
           color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
+
+        val pipeline = ModelCatalog.textTo4kPipeline
+        val pipelineReady = pipeline.all { spec ->
+          state.modelStates[spec.id].orEmpty().let { files ->
+            files.values.isNotEmpty() && files.values.all { it is ModelState.Ready }
+          }
+        }
+        val busy = pipeline.any { state.downloads.containsKey(it.id) }
+
+        Text(
+          "Image generation needs ${pipeline.size} graphs — encoder, transformer, decoder " +
+            "and upscaler — plus the tokenizer and the latent statistics. This fetches all " +
+            "of them, one after another.",
+          style = MaterialTheme.typography.labelSmall,
+          color = MaterialTheme.colorScheme.onSurfaceVariant,
+          modifier = Modifier.padding(top = 12.dp),
+        )
+        Button(
+          onClick = vm::downloadImagePipeline,
+          enabled = !busy && !pipelineReady,
+          modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
+        ) {
+          Text(
+            when {
+              pipelineReady -> "Everything for image generation is downloaded"
+              busy -> "Downloading…"
+              else -> "Download everything for image generation"
+            }
+          )
+        }
       }
     }
 
@@ -43,7 +73,12 @@ fun ModelsScreen(vm: AppViewModel, state: UiState) {
 
       SectionCard(spec.displayName) {
         InfoRow("Role", spec.role.name)
-        InfoRow("Size", formatBytes(spec.totalBytes))
+        InfoRow(
+          "Size",
+          // 0 means the catalogue refuses to carry a figure nobody measured, not an empty
+          // file. Showing "0 B" would read as a broken entry.
+          if (spec.totalBytes > 0) formatBytes(spec.totalBytes) else "known once downloading starts",
+        )
         InfoRow("Targets", spec.accelerators.joinToString(" → "))
         InfoRow("Source", spec.files.first().originLabel())
         if (spec.notes.isNotEmpty()) {

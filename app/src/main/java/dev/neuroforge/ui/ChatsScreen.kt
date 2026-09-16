@@ -250,11 +250,13 @@ private fun Bubble(message: ChatMessage) {
         }
 
         // Which accelerator answered, and how long it took: the two facts that explain a
-        // slow reply without guessing.
-        if (!fromUser && message.accelerator != null) {
+        // slow reply without guessing. Bound to a local because a property from another
+        // module cannot be smart-cast after a null check.
+        val accel = message.accelerator
+        if (!fromUser && accel != null) {
           Text(
             buildString {
-              append(message.accelerator.name)
+              append(accel.name)
               if (message.millis > 0) append(" · ${message.millis / 1000.0}s")
             },
             style = MaterialTheme.typography.labelSmall,

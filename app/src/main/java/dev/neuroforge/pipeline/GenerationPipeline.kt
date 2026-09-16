@@ -6,7 +6,9 @@ import android.os.SystemClock
 import android.util.Log
 import dev.neuroforge.core.Accel
 import dev.neuroforge.core.AcceleratorPolicy
+import dev.neuroforge.core.Bonsai
 import dev.neuroforge.core.FlowMatchEulerScheduler
+import dev.neuroforge.core.GraphBinding
 import dev.neuroforge.core.LatentPacking
 import dev.neuroforge.core.LatentSpec
 import dev.neuroforge.core.ModelCatalog
@@ -17,8 +19,8 @@ import dev.neuroforge.core.RenderPlan
 import dev.neuroforge.core.Scheduler
 import dev.neuroforge.core.TensorLayout
 import dev.neuroforge.core.asHwc
+import dev.neuroforge.core.tokenNoise
 import dev.neuroforge.core.UpscaleStrategy
-import dev.neuroforge.core.latentNoise
 import dev.neuroforge.imaging.ImageTensor
 import dev.neuroforge.imaging.Normalization
 import dev.neuroforge.imaging.TiledUpscaler
@@ -33,8 +35,7 @@ import kotlin.coroutines.coroutineContext
 data class GenerationRequest(
   val prompt: String,
   val seed: Long = System.currentTimeMillis(),
-  val steps: Int = 4,
-  val guidance: Float = 1.0f,
+  val steps: Int = Bonsai.DEFAULT_STEPS,
   val target: OutputTarget = OutputTarget.SQUARE_4K,
   val strategy: UpscaleStrategy = UpscaleStrategy.FAST,
   val upscale: Boolean = true,
@@ -76,14 +77,29 @@ data class GenerationResult(
  * ## The shape of the run
  *
  * ```
- *   prompt ──▶ text encoder ──▶ embeddings
- *                                  │
- *   seed ──▶ latent noise ──▶ [ DiT × steps ] ──▶ latent ──▶ VAE ──▶ 512² image
+ *   prompt ─▶ chat template ─▶ 256 ids + mask ─▶ [ text encoder ] ─▶ embeddings
+ *                                                                        │
+ *   seed ──▶ noise (1024 × 128) ────────▶ [ DiT × steps ] ◀───────────────┘
+ *                                                │
+ *                             latent affine + unpatchify
+ *                                                ▼
+ *                                   (1, 32, 64, 64) ─▶ [ VAE ] ─▶ 512² image
  *                                                                        │
  *                                            ┌───────────────────────────┘
  *                                            ▼
  *                              resample ──▶ [ ×4 SR over N tiles ] ──▶ 4K image
  * ```
+ *
+ * ## Every number here was read, not inferred
+ *
+ * An earlier version of this file assumed the FLUX family's defaults — 16 latent channels,
+ * 77 prompt tokens, a time-shift of 3.0, a `timestep` scaled by 1000, a three-input DiT —
+ * and every one of them was wrong for this model. None of them would have thrown. The
+ * graphs are fixed-shape and fully float; hand them a correctly-shaped tensor of wrong
+ * numbers and they return a correctly-shaped image of noise. So the contract now comes
+ * from [Bonsai], which mirrors the model's own reference host loop, and the pieces that
+ * cannot be known until load time — how many elements each input buffer holds — are
+ * checked rather than assumed.
  *
  * ## Why the graphs are loaded one at a time
  *
@@ -104,27 +120,28 @@ class GenerationPipeline(
    * The I/O contract each converted graph must satisfy.
    *
    * Written down rather than discovered, because a mismatch here does not crash — it
-   * produces a plausible-looking wrong image. The pipeline validates what it can (buffer
-   * counts and element counts) at load time and fails with a message naming the mismatch.
+   * produces a plausible-looking wrong image. What the pipeline *can* check at load time
+   * (input arity and element counts) it does check, and fails with a message naming the
+   * mismatch.
    */
   data class GraphContract(
-    val latent: LatentSpec = LatentSpec.FLUX,
-    val imageSize: Int = 512,
-    val maxPromptTokens: Int = 77,
-    val embeddingDim: Int = 2560,
+    val latent: LatentSpec = LatentSpec.BONSAI,
+    val imageSize: Int = Bonsai.IMAGE_SIZE,
+    val promptTokens: Int = Bonsai.SEQ,
     /**
      * Channel order of the VAE decoder's output.
      *
-     * Declared rather than guessed. The upstream decoder is CHW like every PyTorch vision
-     * model; whether the converted graph still is depends on whether the conversion inserted
-     * a transpose. Guessing wrong does not fail — it produces an image with the colour
-     * channels smeared across the frame, which reads as a broken model rather than a
-     * one-line layout bug, so it is a setting with a stated default.
+     * The reference reads it as `(1, 3, 512, 512)` and transposes to HWC before saving, so
+     * CHW is not a guess here. It stays a setting because a re-export could insert the
+     * transpose into the graph, and guessing wrong does not fail — it produces an image
+     * with the colour channels smeared across the frame.
      */
     val vaeOutputLayout: TensorLayout = TensorLayout.CHW,
   ) {
     val latentSide: Int get() = imageSize / latent.vaeScale
     val tokenCount: Int get() = latent.tokenCount(imageSize, imageSize)
+    val packedWidth: Int get() = latent.tokenDim()
+    val packedElements: Int get() = tokenCount * packedWidth
   }
 
   suspend fun generate(
@@ -137,38 +154,76 @@ class GenerationPipeline(
     fun report(stage: GenerationStage, fraction: Float, detail: String) =
       onProgress(GenerationProgress(stage, fraction, detail, SystemClock.elapsedRealtime() - started))
 
-    requireReady(ModelCatalog.BONSAI_TEXT_ENCODER, ModelCatalog.BONSAI_DIT, ModelCatalog.BONSAI_VAE)
+    val encoderSpec = ModelCatalog.BONSAI_TEXT_ENCODER
+    requireReady(encoderSpec, ModelCatalog.BONSAI_DIT, ModelCatalog.BONSAI_VAE)
+
+    // Latent normalisation travels with the checkpoint, so it is read before anything runs:
+    // a missing file is better discovered now than after two gigabytes of weights have been
+    // paged in and four denoising steps have gone by.
+    val meta = PipelineMeta.read(repository.fileFor(encoderSpec, metaFileOf(encoderSpec)))
+    require(meta.latentBnScale.size == contract.packedWidth) {
+      "pipeline_meta.json describes a ${meta.latentBnScale.size}-wide latent but this " +
+        "pipeline packs ${contract.packedWidth}. The metadata and the graphs are from " +
+        "different releases."
+    }
 
     // ---- 1. Text ---------------------------------------------------------------------
     report(GenerationStage.LoadingTextEncoder, 0f, "Loading text encoder (1.7 GiB)")
-    val embeddings = stage(ModelCatalog.BONSAI_TEXT_ENCODER, timings, "text encoder", request.policy) { session ->
+    val embeddings = stage(encoderSpec, timings, "text encoder", request.policy) { session ->
       coroutineContext.ensureActive()
       report(GenerationStage.Encoding, 0.05f, "Encoding prompt on ${session.accelerator}")
-      val ids = PromptTokenizer.forModel(context, repository, ModelCatalog.BONSAI_TEXT_ENCODER)
-        .encodePadded(request.prompt, contract.maxPromptTokens)
-      session.writeInput(0, ids)
+
+      // The encoder was trained on chat-formatted text and converted at a fixed length; the
+      // mask is what stops it attending to the padding as though it were prompt.
+      val encoded = PromptTokenizer.forModel(context, repository, encoderSpec)
+        .encode(Bonsai.chatPrompt(request.prompt), contract.promptTokens)
+
+      check(session.inputCount == 2) {
+        "the text encoder declares ${session.inputCount} inputs; this pipeline feeds " +
+          "(input_ids, attention_mask)"
+      }
+      // Both inputs are (1, 256), so their lengths cannot tell them apart and the declared
+      // order is all there is to go on. This is the one place in the pipeline where that is
+      // true, and the reference implementation flags it for the same reason.
+      session.writeInput(0, encoded.ids)
+      session.writeInput(1, encoded.mask)
       session.run()
       session.readOutput(0)
     }
+    Log.i(TAG, "prompt embeddings: ${embeddings.size} elements")
 
     // ---- 2. Denoise ------------------------------------------------------------------
-    val scheduler: Scheduler = FlowMatchEulerScheduler(numInferenceSteps = request.steps)
-    val latentSide = contract.latentSide
-    val latent = latentNoise(
-      seed = request.seed,
-      channels = contract.latent.channels,
-      height = latentSide,
-      width = latentSide,
-    )
+    // The latent lives in token space for the whole loop. The reference never packs or
+    // unpacks between steps; it draws (1024, 128) noise and unpatchifies once at the end.
+    val latent = tokenNoise(request.seed, contract.tokenCount, contract.packedWidth)
+    val scheduler: Scheduler = FlowMatchEulerScheduler.forImage(contract.tokenCount, request.steps)
     for (i in latent.indices) latent[i] *= scheduler.initialNoiseScale
     val rng = Pcg32(request.seed xor SAMPLER_STREAM)
 
+    val imageIds = Bonsai.imagePositionIds(contract.latentSide / contract.latent.patch)
+    val textIds = Bonsai.textPositionIds(contract.promptTokens)
+
     stage(ModelCatalog.BONSAI_DIT, timings, "diffusion transformer", request.policy) { session ->
-      check(session.inputCount >= 3) {
-        "the diffusion graph declares ${session.inputCount} inputs; this pipeline feeds " +
-          "(packed latent, prompt embeddings, timestep) and needs at least 3"
-      }
-      session.writeInput(1, embeddings)
+      // Argument order, in the order the model's forward() declares it.
+      val wanted = intArrayOf(
+        contract.packedElements, embeddings.size, 1, imageIds.size, textIds.size,
+      )
+      val declared = IntArray(session.inputCount) { session.inputElementCount(it) }
+      val binding = GraphBinding.bind(declared, wanted) ?: error(
+        GraphBinding.describeMismatch(
+          "The diffusion transformer", declared,
+          mapOf(
+            "latent" to wanted[0], "embeddings" to wanted[1], "sigma" to wanted[2],
+            "img_ids" to wanted[3], "txt_ids" to wanted[4],
+          ),
+        )
+      )
+      Log.i(TAG, "DiT inputs bound by ${binding.basis}: ${binding.slots.toList()}")
+
+      // Three of the five inputs never change during the loop, so they are written once.
+      session.writeInput(binding[ARG_EMBEDDINGS], embeddings)
+      session.writeInput(binding[ARG_IMG_IDS], imageIds)
+      session.writeInput(binding[ARG_TXT_IDS], textIds)
 
       scheduler.steps.forEach { step ->
         coroutineContext.ensureActive()
@@ -177,24 +232,25 @@ class GenerationPipeline(
           0.1f + 0.5f * (step.index.toFloat() / scheduler.steps.size),
           "Step ${step.index + 1}/${scheduler.steps.size} on ${session.accelerator}",
         )
-
-        val tokens = LatentPacking.patchify(latent, contract.latent, latentSide, latentSide)
-        session.writeInput(0, tokens)
-        session.writeInput(2, floatArrayOf(step.timestep))
+        session.writeInput(binding[ARG_LATENT], latent)
+        session.writeInput(binding[ARG_SIGMA], floatArrayOf(step.timestep))
         session.run()
-
-        val velocity = LatentPacking.unpatchify(
-          session.readOutput(0), contract.latent, latentSide, latentSide,
-        )
-        scheduler.step(step.index, latent, velocity, rng)
+        scheduler.step(step.index, latent, session.readOutput(0), rng)
       }
       Unit
     }
 
     // ---- 3. Decode -------------------------------------------------------------------
     report(GenerationStage.Decoding, 0.62f, "Decoding latent")
+    // Affine first, on the packed axis, then the patch unfold — the only order in which a
+    // 128-wide vector lines up with anything.
+    Bonsai.denormalize(latent, meta.latentBnScale, meta.latentBnShift)
+    val vaeLatent = LatentPacking.unpatchify(
+      latent, contract.latent, contract.latentSide, contract.latentSide,
+    )
+
     val baseImage = stage(ModelCatalog.BONSAI_VAE, timings, "VAE decoder", request.policy) { session ->
-      session.writeInput(0, latent)
+      session.writeInput(0, vaeLatent)
       session.run()
       val pixels = asHwc(
         session.readOutput(0),
@@ -280,6 +336,10 @@ class GenerationPipeline(
     }
   }
 
+  private fun metaFileOf(spec: ModelSpec) =
+    spec.files.firstOrNull { it.fileName == "pipeline_meta.json" }
+      ?: error("${spec.id} has no pipeline_meta.json entry in the catalogue")
+
   private fun requireReady(vararg specs: ModelSpec) {
     val missing = specs.filterNot { repository.isReady(it) }
     if (missing.isNotEmpty()) {
@@ -289,6 +349,14 @@ class GenerationPipeline(
 
   private companion object {
     const val TAG = "GenerationPipeline"
+
+    // The DiT's arguments, in the order its forward() declares them:
+    // dit(lat, embeds, sigma, img_ids, txt_ids).
+    const val ARG_LATENT = 0
+    const val ARG_EMBEDDINGS = 1
+    const val ARG_SIGMA = 2
+    const val ARG_IMG_IDS = 3
+    const val ARG_TXT_IDS = 4
 
     /**
      * Keeps the ancestral sampler's noise on a different stream from the initial latent, so

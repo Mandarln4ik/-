@@ -84,3 +84,16 @@ class Pcg32(seed: Long, sequence: Long = DEFAULT_SEQUENCE) {
  */
 fun latentNoise(seed: Long, channels: Int, height: Int, width: Int): FloatArray =
   Pcg32(seed).gaussians(channels * height * width)
+
+/**
+ * Initial noise for a transformer that works directly in token space.
+ *
+ * A DiT does not iterate on a `C×H×W` grid; it iterates on the `tokens × packedChannels`
+ * sequence, and the reference pipeline draws its noise in exactly that shape. It holds the
+ * same number of values as [latentNoise] would for the same image, which is why getting it
+ * wrong is invisible: packing noise as though it were a latent image, denoising it, and
+ * unpacking it again yields a differently-shuffled but equally valid draw, so the run
+ * completes and only the seed stops meaning anything.
+ */
+fun tokenNoise(seed: Long, tokens: Int, packedChannels: Int): FloatArray =
+  Pcg32(seed).gaussians(tokens * packedChannels)

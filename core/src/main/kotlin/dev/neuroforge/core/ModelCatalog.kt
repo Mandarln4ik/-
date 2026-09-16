@@ -89,14 +89,30 @@ sealed interface ModelSource {
    *   warning, and a name that is merely plausible produces a 404 at the worst moment — on
    *   someone's phone, at the point they press Download. So [hints] exists: when [path] is
    *   not there, the repository is listed and the file is picked by these instead.
-   * @param hints lowercase substrings that identify the right file among the repo's other
-   *   `.tflite` files, most significant first.
+   * @param hints lowercase substrings that *rank* the candidates — typically the
+   *   quantisation recipe. A file matching none of them is still a candidate.
+   * @param requires lowercase substrings a candidate *must* contain. This is for telling
+   *   apart the different models in one repository: the Bonsai release holds a DiT, a text
+   *   encoder and a VAE, and picking the wrong one is worse than reporting nothing found,
+   *   because it fails later and somewhere else. Leave it empty in a single-model
+   *   repository, where whatever is published is by definition the file wanted.
    */
   data class HuggingFace(
     val repoId: String,
     val path: String,
     val hints: List<String> = emptyList(),
-  ) : ModelSource
+    val requires: List<String> = emptyList(),
+  ) : ModelSource {
+    /**
+     * The file extension to search for when [path] turns out not to exist.
+     *
+     * Derived rather than declared: a `.litertlm` engine bundle, a `.json` tokenizer and a
+     * `.tflite` graph all go through the same resolution path, and defaulting the search to
+     * `.tflite` meant a renamed `.litertlm` could never be found — the listing was fetched
+     * and then filtered down to nothing.
+     */
+    val extension: String get() = "." + path.substringAfterLast('.', "tflite")
+  }
 
   /** Any direct URL — a GitHub release asset, a mirror. */
   data class Direct(val url: String, val origin: String) : ModelSource
@@ -118,17 +134,24 @@ fun chooseModelFile(
   expected: String,
   hints: List<String>,
   extension: String = ".tflite",
+  requires: List<String> = emptyList(),
 ): String? {
-  val candidates = available.filter { it.endsWith(extension, ignoreCase = true) }
+  val candidates = available
+    .filter { it.endsWith(extension, ignoreCase = true) }
+    // A required substring identifies *which* model, so a candidate missing one is a
+    // different graph, not a differently-quantised version of this one.
+    .filter { name -> requires.all { name.contains(it, ignoreCase = true) } }
   if (candidates.isEmpty()) return null
   candidates.firstOrNull { it.equals(expected, ignoreCase = true) }?.let { return it }
 
+  // Hints only rank. A repository that publishes a q8 build where the hints ask for int4
+  // still has exactly one file worth downloading, and returning null there would turn a
+  // usable model into "not found".
   return candidates
     .map { name ->
       val lower = name.lowercase()
       name to hints.count { lower.contains(it.lowercase()) }
     }
-    .filter { (_, score) -> hints.isEmpty() || score > 0 }
     .minWithOrNull(
       compareByDescending<Pair<String, Int>> { it.second }.thenBy { it.first.length }
         .thenBy { it.first },
@@ -233,6 +256,9 @@ data class ModelSpec(
  */
 object ModelCatalog {
 
+  /** The converted Bonsai release: three graphs, the tokenizer and the latent statistics. */
+  private const val BONSAI_REPO = "litert-community/Bonsai-Image-ternary-4B"
+
   /**
    * MobileNetV3-Small, int8 — the smoke test that answers "does the NPU work here".
    *
@@ -319,27 +345,50 @@ object ModelCatalog {
     accelerators = listOf(Accel.CPU),
     files = listOf(
       ModelFile(
-        fileName = "bonsai_text_encoder_int4.tflite",
+        fileName = "textenc_int4.tflite",
         source = ModelSource.HuggingFace(
-          "litert-community/Bonsai-Image-ternary-4B", "textenc_int4.tflite",
-          hints = listOf("textenc", "int4"),
+          BONSAI_REPO, "textenc_int4.tflite",
+          requires = listOf("textenc"), hints = listOf("int4"),
         ),
+        // Deliberately 0: the README says "1.68 GiB", which is a rounded figure and not a
+        // size. Only a number someone actually measured belongs here, and CI now prints the
+        // Content-Length of every catalogued file so it can be pinned rather than estimated.
         sizeBytes = 0L,
       ),
-      // The vocabulary lives in a `tokenizer/` DIRECTORY in that repository, not a single
-      // `tokenizer.json` - CI's listing showed it. Rather than replace one guess with
-      // another, this fetches the pipeline metadata, which names what the reference
-      // implementation actually loads; the tokenizer entry follows once that is read.
+      // Latent BatchNorm statistics and the graph file names. The reference host loop reads
+      // this before anything else, and without the two 128-wide vectors in it the decoded
+      // image comes out washed out rather than wrong in any way that raises an error.
       ModelFile(
         fileName = "pipeline_meta.json",
         source = ModelSource.HuggingFace(
-          "litert-community/Bonsai-Image-ternary-4B", "pipeline_meta.json",
-          hints = listOf("pipeline_meta"),
+          BONSAI_REPO, "pipeline_meta.json",
+          requires = listOf("pipeline_meta"),
+        ),
+        sizeBytes = 0L,
+      ),
+      // The vocabulary lives in a `tokenizer/` directory in that repository - CI's listing
+      // showed it - so the path has a prefix and the local name does not.
+      ModelFile(
+        fileName = "tokenizer.json",
+        source = ModelSource.HuggingFace(
+          BONSAI_REPO, "tokenizer/tokenizer.json",
+          requires = listOf("tokenizer.json"),
+        ),
+        sizeBytes = 0L,
+      ),
+      // Carries the pad token and the chat template. Both are things this app would
+      // otherwise have to assume, and assuming either one shifts every embedding.
+      ModelFile(
+        fileName = "tokenizer_config.json",
+        source = ModelSource.HuggingFace(
+          BONSAI_REPO, "tokenizer/tokenizer_config.json",
+          requires = listOf("tokenizer_config"),
         ),
         sizeBytes = 0L,
       ),
     ),
-    notes = "Only hidden layers 9/18/27 are read, so the top 9 layers and the LM head prune away.",
+    notes = "Only hidden layers 9/18/27 are read, so the top 9 layers and the LM head prune " +
+      "away. Takes 256 prompt tokens wrapped in the Qwen3 chat template.",
   )
 
   val BONSAI_DIT = ModelSpec(
@@ -349,10 +398,11 @@ object ModelCatalog {
     accelerators = listOf(Accel.CPU),
     files = listOf(
       ModelFile(
-        fileName = "bonsai_dit_int4.tflite",
+        fileName = "dit_int4b32.tflite",
         source = ModelSource.HuggingFace(
-          "litert-community/Bonsai-Image-ternary-4B", "dit_int4b32.tflite",
-          hints = listOf("dit", "int4b32"),
+          BONSAI_REPO, "dit_int4b32.tflite",
+          // Not `dit_gpu_*`: that is a separate GPU-targeted export of the same weights.
+          requires = listOf("dit"), hints = listOf("int4b32"),
         ),
         sizeBytes = 0L,
       )
@@ -370,10 +420,10 @@ object ModelCatalog {
     inputRange = InputRange.SIGNED,
     files = listOf(
       ModelFile(
-        fileName = "bonsai_vae_decoder.tflite",
+        fileName = "vae_dec_fp32.tflite",
         source = ModelSource.HuggingFace(
-          "litert-community/Bonsai-Image-ternary-4B", "vae_dec_fp32.tflite",
-          hints = listOf("vae_dec", "fp32"),
+          BONSAI_REPO, "vae_dec_fp32.tflite",
+          requires = listOf("vae"), hints = listOf("dec", "fp32"),
         ),
         sizeBytes = 0L,
       )
@@ -389,9 +439,10 @@ object ModelCatalog {
    * of the same pieces. It also exposes `Backend.NPU`, so this is the one place where a
    * generative model really can reach the APU.
    *
-   * The file name here is unverified. That is no longer a gamble: CI probes every
-   * catalogued URL on each commit and prints the repository's real contents when one is
-   * wrong, which is how the four names before it got corrected.
+   * The file name here is a starting point, not a claim. `litert-community` renames and
+   * re-quantises these bundles, so the app resolves the real name from the repository
+   * listing when the declared one is gone, and CI runs that same resolution on every commit
+   * and prints what it landed on. That is how the four names before it got corrected.
    */
   val LLM_GEMMA3_1B = ModelSpec(
     id = "llm.gemma3_1b_it",
@@ -404,7 +455,9 @@ object ModelCatalog {
         source = ModelSource.HuggingFace(
           repoId = "litert-community/Gemma3-1B-IT",
           path = "gemma3-1b-it-int4.litertlm",
-          hints = listOf("litertlm", "int4", "q4"),
+          // Ranked, not required: an int4 build is the one worth having on an APU, but a
+          // repository that only publishes q8 still has exactly one usable file.
+          hints = listOf("int4", "q4", "ekv"),
         ),
         sizeBytes = 0L,
       )
@@ -424,7 +477,7 @@ object ModelCatalog {
         source = ModelSource.HuggingFace(
           repoId = "litert-community/Qwen3-0.6B",
           path = "qwen3-0.6b-int4.litertlm",
-          hints = listOf("litertlm", "int4", "q4"),
+          hints = listOf("int4", "q4", "ekv"),
         ),
         sizeBytes = 0L,
       )

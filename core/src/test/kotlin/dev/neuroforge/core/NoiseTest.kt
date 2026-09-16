@@ -56,4 +56,16 @@ class NoiseTest {
   fun `latent length matches the requested shape`() {
     assertEquals(4 * 64 * 64, latentNoise(1, 4, 64, 64).size)
   }
+
+  @Test
+  fun `token noise is drawn in the shape the transformer iterates on`() {
+    // The DiT never sees a C x H x W grid; it sees (tokens, packedChannels). The two hold
+    // the same number of values for the same image, so drawing the wrong one produces a
+    // valid run with a seed that no longer means anything.
+    val tokens = tokenNoise(seed = 3, tokens = Bonsai.TOKENS, packedChannels = Bonsai.PACKED_CHANNELS)
+    assertEquals(Bonsai.TOKENS * Bonsai.PACKED_CHANNELS, tokens.size)
+    assertEquals(latentNoise(3, 32, 64, 64).size, tokens.size)
+    assertTrue(tokens.contentEquals(tokenNoise(3, Bonsai.TOKENS, Bonsai.PACKED_CHANNELS)))
+    assertTrue(!tokens.contentEquals(tokenNoise(4, Bonsai.TOKENS, Bonsai.PACKED_CHANNELS)))
+  }
 }
