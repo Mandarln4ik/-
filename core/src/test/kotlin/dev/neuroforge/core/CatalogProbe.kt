@@ -63,7 +63,7 @@ fun main() {
   // The reference host loop's own constants, printed so the pipeline's tensor contract is
   // something read on every commit rather than remembered from one.
   dump("Bonsai pipeline_meta.json (head)", "$HF/$BONSAI/resolve/main/pipeline_meta.json", 400)
-  chatTemplate("$HF/$BONSAI/resolve/main/tokenizer/tokenizer_config.json")
+  chatTemplate()
 
   println()
   println("$failures unresolvable, $resolvedByListing resolved by listing, $gated gated")
@@ -165,30 +165,49 @@ private fun dump(title: String, url: String, limit: Int) {
 }
 
 /**
- * Prints just the repository's `chat_template`, and whether [Bonsai.chatPrompt] agrees.
+ * Finds and prints the repository's chat template, wherever it is kept.
+ *
+ * Two places, because transformers moved: older checkpoints embed it as a `chat_template`
+ * string inside `tokenizer_config.json`, newer ones save it as a separate
+ * `chat_template.jinja`. The Bonsai release has no `chat_template` key at all, so the
+ * template this app renders as a constant was still unverified after the first run of this
+ * check — which is exactly the situation this whole file exists to end.
  *
  * The template is Jinja and is not rendered on a phone, so the app carries the rendered
  * form as a constant. This is what keeps that constant honest: a divergence shows up here
  * rather than as an image that quietly answers a slightly different prompt.
  */
-private fun chatTemplate(url: String) {
+private fun chatTemplate() {
+  println()
+  println("=== Bonsai tokenizer/ ===")
+  val tokenizerFiles = listRepo(BONSAI).filter { it.startsWith("tokenizer") }
+  tokenizerFiles.forEach { println("  $it") }
+
+  val fromJinja = tokenizerFiles.firstOrNull { it.endsWith("chat_template.jinja") }
+    ?.let { fetch("$HF/$BONSAI/resolve/main/$it") }
+  val fromConfig = fetch("$HF/$BONSAI/resolve/main/tokenizer/tokenizer_config.json")
+    ?.let { body ->
+      Regex("\"chat_template\"\\s*:\\s*\"((?:[^\"\\\\]|\\\\.)*)\"")
+        .find(body)?.groupValues?.get(1)?.replace("\\n", "\n")?.replace("\\\"", "\"")
+    }
+
   println()
   println("=== Bonsai chat template ===")
-  val body = runCatching { URL(url).readText() }.getOrElse {
-    println("(unavailable: ${it.message})")
-    return
-  }
-  val template = Regex("\"chat_template\"\\s*:\\s*\"((?:[^\"\\\\]|\\\\.)*)\"")
-    .find(body)?.groupValues?.get(1)
+  val template = fromJinja ?: fromConfig
   if (template == null) {
-    println("(no chat_template in tokenizer_config.json)")
-    return
+    println("(not found in tokenizer_config.json or a chat_template.jinja)")
+  } else {
+    println("source: ${if (fromJinja != null) "chat_template.jinja" else "tokenizer_config.json"}")
+    println(template.take(2500))
   }
-  println(template.replace("\\n", "\n").take(2500))
+
   println()
-  val rendered = Bonsai.chatPrompt("PROMPT")
-  println("this app renders: ${rendered.replace("\n", "\\n")}")
-  listOf("<|im_start|>", "<|im_end|>", "<think>").forEach {
-    println("  template mentions $it: ${template.contains(it)}")
+  println("this app renders: ${Bonsai.chatPrompt("PROMPT").replace("\n", "\\n")}")
+  if (template != null) {
+    listOf("<|im_start|>", "<|im_end|>", "<think>", "enable_thinking").forEach {
+      println("  template mentions $it: ${template.contains(it)}")
+    }
   }
 }
+
+private fun fetch(url: String): String? = runCatching { URL(url).readText() }.getOrNull()
