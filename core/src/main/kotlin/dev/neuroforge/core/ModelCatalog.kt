@@ -1,7 +1,7 @@
 package dev.neuroforge.core
 
 /** What a graph does inside the pipeline. */
-enum class ModelRole { TEXT_ENCODER, DENOISER, VAE_DECODER, UPSCALER, BENCHMARK }
+enum class ModelRole { TEXT_ENCODER, TEXT_CHAT, DENOISER, VAE_DECODER, UPSCALER, AUDIO, BENCHMARK }
 
 /** An inference target. */
 enum class Accel { NPU, GPU, CPU }
@@ -155,6 +155,16 @@ data class ModelFile(
 ) {
   val isArchive: Boolean get() = archiveMember != null
 
+  /**
+   * True when this entry's bytes were actually inspected rather than inferred.
+   *
+   * Only a pinned [sha256] means someone downloaded the file and hashed it. Without one,
+   * [sizeBytes] is a figure read off a model card — useful for a progress bar, and no basis
+   * for rejecting a download. Treating a guessed size as a gate turns a slightly stale
+   * catalogue into "nothing downloads", which is exactly what happened.
+   */
+  val verified: Boolean get() = sha256 != null
+
   fun downloadUrl(huggingFaceEndpoint: String = HF_ENDPOINT): String = when (source) {
     is ModelSource.HuggingFace ->
       "$huggingFaceEndpoint/${source.repoId}/resolve/main/${source.path}?download=true"
@@ -233,26 +243,28 @@ object ModelCatalog {
    */
   val BENCHMARK_MOBILENET = ModelSpec(
     id = "bench.mobilenet_v3_small_int8",
-    displayName = "MobileNetV3-Small (int8) — NPU smoke test",
+    displayName = "MobileNetV3-Small (int8 weights) — NPU smoke test",
     role = ModelRole.BENCHMARK,
     accelerators = listOf(Accel.NPU, Accel.GPU, Accel.CPU),
     inputShape = intArrayOf(1, 224, 224, 3),
     inputRange = InputRange.UNIT,
     files = listOf(
       ModelFile(
-        fileName = "mobilenet_v3_small_int8.tflite",
+        fileName = "mobilenet_v3_small_wi8.tflite",
         source = ModelSource.HuggingFace(
           repoId = "litert-community/MobileNet-v3-small",
-          path = "mobilenet_v3_small_int8_channelwise.tflite",
-          // The exact name could not be verified when this entry was written, and the guess
-          // was wrong: it 404'd on device. These pick the int8 variant out of the listing
-          // whatever it ends up being called.
-          hints = listOf("int8", "quant"),
+          // Verified against the real repository listing by CI, not guessed. Note the
+          // naming: `wi8` (weight int8), not `int8` - an earlier hint list looking for
+          // "int8" would have missed this file too.
+          path = "mobilenet_v3_small_weight_only_wi8_afp32.tflite",
+          hints = listOf("wi8", "weight_only"),
         ),
         sizeBytes = 0L,
       )
     ),
-    notes = "Channelwise int8 weights and int8 activations — the shape an APU compiles cleanly.",
+    notes = "Weight-only int8 with fp32 activations. That is what the repository publishes; " +
+      "a fully integer graph would suit an APU better, so if the NPU refuses this one, that " +
+      "is the reason rather than a broken NPU path.",
   )
 
   /**
@@ -309,17 +321,20 @@ object ModelCatalog {
       ModelFile(
         fileName = "bonsai_text_encoder_int4.tflite",
         source = ModelSource.HuggingFace(
-          "litert-community/Bonsai-Image-ternary-4B", "text_encoder_int4.tflite",
-          hints = listOf("text_encoder", "int4"),
+          "litert-community/Bonsai-Image-ternary-4B", "textenc_int4.tflite",
+          hints = listOf("textenc", "int4"),
         ),
-        sizeBytes = 1_803_886_592L,
+        sizeBytes = 0L,
       ),
-      // The vocabulary travels with the weights. Ids from a different tokenizer do not
-      // fail - they quietly encode a different prompt - so this is not optional.
+      // The vocabulary lives in a `tokenizer/` DIRECTORY in that repository, not a single
+      // `tokenizer.json` - CI's listing showed it. Rather than replace one guess with
+      // another, this fetches the pipeline metadata, which names what the reference
+      // implementation actually loads; the tokenizer entry follows once that is read.
       ModelFile(
-        fileName = "tokenizer.json",
+        fileName = "pipeline_meta.json",
         source = ModelSource.HuggingFace(
-          "litert-community/Bonsai-Image-ternary-4B", "tokenizer.json",
+          "litert-community/Bonsai-Image-ternary-4B", "pipeline_meta.json",
+          hints = listOf("pipeline_meta"),
         ),
         sizeBytes = 0L,
       ),
@@ -336,14 +351,15 @@ object ModelCatalog {
       ModelFile(
         fileName = "bonsai_dit_int4.tflite",
         source = ModelSource.HuggingFace(
-          "litert-community/Bonsai-Image-ternary-4B", "dit_int4.tflite",
-          hints = listOf("dit", "int4"),
+          "litert-community/Bonsai-Image-ternary-4B", "dit_int4b32.tflite",
+          hints = listOf("dit", "int4b32"),
         ),
-        sizeBytes = 2_265_524_224L,
+        sizeBytes = 0L,
       )
     ),
-    notes = "CPU by design: blockwise int4 with dynamic attention is not what an APU " +
-      "accelerates. Needs XNNPACK explicitly attached.",
+    notes = "Not an NPU target: blockwise int4 with dynamic attention is not what an APU " +
+      "accelerates. The repository also publishes dit_gpu_int4b32.tflite, a GPU-targeted " +
+      "export, so GPU is worth trying even though the NPU is not. Needs XNNPACK attached.",
   )
 
   val BONSAI_VAE = ModelSpec(
@@ -356,18 +372,71 @@ object ModelCatalog {
       ModelFile(
         fileName = "bonsai_vae_decoder.tflite",
         source = ModelSource.HuggingFace(
-          "litert-community/Bonsai-Image-ternary-4B", "vae_decoder.tflite",
-          hints = listOf("vae", "decoder"),
+          "litert-community/Bonsai-Image-ternary-4B", "vae_dec_fp32.tflite",
+          hints = listOf("vae_dec", "fp32"),
         ),
-        sizeBytes = 204_010_496L,
+        sizeBytes = 0L,
       )
     ),
     notes = "Convolutional and fixed-shape — the one generator stage worth trying on GPU.",
   )
 
+  /**
+   * Gemma 3 1B, instruction-tuned — a text model small enough to be worth running here.
+   *
+   * LiteRT-LM is a different runtime from the CompiledModel API the vision graphs use: it
+   * owns the KV cache and the decode loop, which is why a chat cannot simply be built out
+   * of the same pieces. It also exposes `Backend.NPU`, so this is the one place where a
+   * generative model really can reach the APU.
+   *
+   * The file name here is unverified. That is no longer a gamble: CI probes every
+   * catalogued URL on each commit and prints the repository's real contents when one is
+   * wrong, which is how the four names before it got corrected.
+   */
+  val LLM_GEMMA3_1B = ModelSpec(
+    id = "llm.gemma3_1b_it",
+    displayName = "Gemma 3 1B Instruct",
+    role = ModelRole.TEXT_CHAT,
+    accelerators = listOf(Accel.NPU, Accel.GPU, Accel.CPU),
+    files = listOf(
+      ModelFile(
+        fileName = "gemma3_1b_it.litertlm",
+        source = ModelSource.HuggingFace(
+          repoId = "litert-community/Gemma3-1B-IT",
+          path = "gemma3-1b-it-int4.litertlm",
+          hints = listOf("litertlm", "int4", "q4"),
+        ),
+        sizeBytes = 0L,
+      )
+    ),
+    notes = "Runs through LiteRT-LM, which supports an NPU backend — unlike the diffusion " +
+      "transformer, this one can genuinely reach the APU.",
+  )
+
+  val LLM_QWEN3_06B = ModelSpec(
+    id = "llm.qwen3_0_6b",
+    displayName = "Qwen3 0.6B",
+    role = ModelRole.TEXT_CHAT,
+    accelerators = listOf(Accel.NPU, Accel.GPU, Accel.CPU),
+    files = listOf(
+      ModelFile(
+        fileName = "qwen3_0_6b.litertlm",
+        source = ModelSource.HuggingFace(
+          repoId = "litert-community/Qwen3-0.6B",
+          path = "qwen3-0.6b-int4.litertlm",
+          hints = listOf("litertlm", "int4", "q4"),
+        ),
+        sizeBytes = 0L,
+      )
+    ),
+    notes = "The smaller of the two; a better first try if memory is tight.",
+  )
+
   /** Everything, for the model-manager screen. */
   val all: List<ModelSpec> = listOf(
     BENCHMARK_MOBILENET,
+    LLM_GEMMA3_1B,
+    LLM_QWEN3_06B,
     UPSCALER_ESRGAN_X4,
     BONSAI_TEXT_ENCODER,
     BONSAI_DIT,

@@ -8,6 +8,7 @@ import androidx.compose.material.icons.filled.Memory
 import androidx.compose.material.icons.filled.AutoAwesome
 import androidx.compose.material.icons.filled.Download
 import androidx.compose.material.icons.filled.Tune
+import androidx.compose.material.icons.filled.Forum
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.NavigationBar
@@ -29,6 +30,7 @@ import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 
 private enum class Tab(val label: String, val icon: ImageVector) {
+  CHATS("Chats", Icons.Filled.Forum),
   GENERATE("Generate", Icons.Filled.AutoAwesome),
   DEVICE("Device", Icons.Filled.Memory),
   MODELS("Models", Icons.Filled.Download),
@@ -39,7 +41,7 @@ private enum class Tab(val label: String, val icon: ImageVector) {
 @Composable
 fun NeuroForgeUi(vm: AppViewModel) {
   val state by vm.state.collectAsStateWithLifecycle()
-  var tab by remember { mutableStateOf(Tab.GENERATE) }
+  var tab by remember { mutableStateOf(Tab.CHATS) }
   val snackbar = remember { SnackbarHostState() }
 
   // Errors are surfaced once and cleared, so a transient download failure does not stick to
@@ -83,6 +85,7 @@ fun NeuroForgeUi(vm: AppViewModel) {
   ) { padding ->
     Column(Modifier.padding(padding)) {
       when (tab) {
+        Tab.CHATS -> ChatsScreen(vm, state)
         Tab.GENERATE -> GenerateScreen(vm, state)
         Tab.DEVICE -> DeviceScreen(vm, state)
         Tab.MODELS -> ModelsScreen(vm, state)

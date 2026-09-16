@@ -22,6 +22,13 @@ dependencies {
   testImplementation(kotlin("test"))
 }
 
+// Prints every catalogued download as `id<TAB>file<TAB>url<TAB>repo`, for CI to probe.
+tasks.register<JavaExec>("dumpCatalog") {
+  group = "verification"
+  mainClass.set("dev.neuroforge.core.CatalogDumpKt")
+  classpath = sourceSets["main"].runtimeClasspath
+}
+
 tasks.test {
   useJUnitPlatform()
   testLogging { events("failed", "skipped") }

@@ -62,3 +62,126 @@ jobs:
 
       - name: Assemble debug
         run: ./gradlew :app:assembleDebug --no-daemon
+
+  catalogue:
+    name: Catalogue URLs resolve
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      # A catalogue entry is a claim about someone else's repository. The authoring
+      # environment cannot reach Hugging Face, so that claim went untested twice and both
+      # times failed on a real phone. CI can reach it, so the check lives here.
+      - name: Probe every catalogued download
+        working-directory: core
+        run: |
+          set -uo pipefail
+          ./gradlew --quiet --console=plain dumpCatalog > /tmp/catalog.tsv
+          echo "checking $(wc -l < /tmp/catalog.tsv) files"
+          failed=0
+          while IFS=$'\t' read -r id file url repo; do
+            [ -z "$url" ] && continue
+            code=$(curl -sIL -o /dev/null -w '%{http_code}' --max-time 45 "$url" || echo 000)
+            size=$(curl -sIL -o /dev/null -w '%{size_download}' --max-time 45 "$url" || echo 0)
+            if [ "$code" = "200" ]; then
+              echo "ok    $id  $file  (HTTP $code)"
+            else
+              echo "FAIL  $id  $file  (HTTP $code)  $url"
+              failed=1
+              if [ -n "$repo" ]; then
+                echo "      files actually in $repo (recursive):"
+                curl -s --max-time 45 \
+                  "https://huggingface.co/api/models/$repo/tree/main?recursive=true" \
+                  | tr ',' '\n' | grep -o '"path":"[^"]*"' | sed 's/"path":"/        /; s/"$//' \
+                  || echo "        (listing failed)"
+              fi
+            fi
+          done < /tmp/catalog.tsv
+
+          # The reference host loop and its metadata describe the tensor contract this app
+          # has so far been inferring. Printing them here turns the pipeline's shapes into
+          # something read rather than assumed.
+          echo
+          echo "=== Bonsai pipeline_meta.json ==="
+          curl -sL --max-time 45 \
+            "https://huggingface.co/litert-community/Bonsai-Image-ternary-4B/resolve/main/pipeline_meta.json" \
+            | head -c 4000 || echo "(unavailable)"
+          echo
+          echo "=== Bonsai generate.py (reference implementation) ==="
+          curl -sL --max-time 45 \
+            "https://huggingface.co/litert-community/Bonsai-Image-ternary-4B/resolve/main/generate.py" \
+            | head -200 || echo "(unavailable)"
+
+          exit $failed
+
+  smoke:
+    name: App launches on an emulator
+    runs-on: ubuntu-latest
+    # The check that would have caught the v1.1.0 launch crash. An initialiser-order fault
+    # compiles without a warning, so assembling the APK proves nothing about whether it
+    # opens; only starting it does.
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Install Android SDK packages
+        run: |
+          set -euo pipefail
+          SDK="${ANDROID_HOME:-$ANDROID_SDK_ROOT}"
+          SDKMANAGER="$(find "$SDK/cmdline-tools" -name sdkmanager -type f | head -1)"
+          yes | "$SDKMANAGER" --licenses > /dev/null 2>&1 || true
+          "$SDKMANAGER" "platforms;android-36" "build-tools;36.0.0"
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      - name: Assemble debug
+        run: ./gradlew :app:assembleDebug --no-daemon
+
+      # KVM is what makes an x86_64 emulator usable rather than glacial.
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: Launch the app and watch for a crash
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 34
+          target: google_apis
+          arch: x86_64
+          force-avd-creation: false
+          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
+          disable-animations: true
+          script: |
+            set -uo pipefail
+            adb install -r app/build/outputs/apk/debug/app-debug.apk
+            adb logcat -c
+            adb shell am start -W -n dev.neuroforge/.MainActivity
+            sleep 12
+
+            # Two independent signals, because either alone lies: a crash dialog can be
+            # dismissed leaving the process alive, and a process can die silently.
+            if adb logcat -d | grep -E "FATAL EXCEPTION|AndroidRuntime.*dev\.neuroforge"; then
+              echo "::error::The app crashed on launch"
+              adb logcat -d | grep -A 40 "FATAL EXCEPTION" | head -60
+              exit 1
+            fi
+            if [ -z "$(adb shell pidof dev.neuroforge)" ]; then
+              echo "::error::The app is not running 12s after launch"
+              adb logcat -d | tail -80
+              exit 1
+            fi
+            echo "app is alive"

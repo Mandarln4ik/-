@@ -12,6 +12,7 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Modifier
@@ -98,7 +99,57 @@ fun ModelsScreen(vm: AppViewModel, state: UiState) {
             ready ->
               OutlinedButton(onClick = { vm.deleteModel(spec) }) { Text("Delete") }
             else ->
-              Button(onClick = { vm.download(spec) }) { Text("Download") }
+              Button(onClick = { vm.download(spec) }) {
+                Text(
+                  if (spec.files.size > 1) "Download all ${spec.files.size} files"
+                  else "Download",
+                )
+              }
+          }
+        }
+      }
+    }
+
+    item {
+      SectionCard("Add a model from Hugging Face") {
+        Text(
+          "Every download that failed in this app failed because a file name in the " +
+            "catalogue was a guess. Point at a repository and pick from what is really " +
+            "there instead.",
+          style = MaterialTheme.typography.bodySmall,
+          color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        OutlinedTextField(
+          value = state.browseRepo,
+          onValueChange = vm::setBrowseRepo,
+          modifier = Modifier.fillMaxWidth().padding(top = 10.dp),
+          singleLine = true,
+          enabled = !state.browsing,
+          label = { Text("owner/name") },
+          placeholder = { Text("litert-community/Qwen3-0.6B") },
+        )
+        Button(
+          onClick = vm::browse,
+          enabled = !state.browsing && state.browseRepo.isNotBlank(),
+          modifier = Modifier.padding(top = 10.dp),
+        ) { Text(if (state.browsing) "Listing…" else "List files") }
+
+        state.browseFiles.forEach { repoFile ->
+          Row(
+            Modifier.fillMaxWidth().padding(top = 8.dp),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = androidx.compose.ui.Alignment.CenterVertically,
+          ) {
+            Text(
+              repoFile.display,
+              style = MaterialTheme.typography.bodySmall,
+              modifier = Modifier.weight(1f),
+            )
+            if (repoFile.isModel) {
+              OutlinedButton(
+                onClick = { vm.downloadFromRepo(state.browseRepo.trim(), repoFile) },
+              ) { Text("Get") }
+            }
           }
         }
       }

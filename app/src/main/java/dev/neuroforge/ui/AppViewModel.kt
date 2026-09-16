@@ -8,14 +8,26 @@ import androidx.lifecycle.viewmodel.initializer
 import androidx.lifecycle.viewmodel.viewModelFactory
 import dev.neuroforge.NeuroForgeApp
 import dev.neuroforge.core.AcceleratorPolicy
+import dev.neuroforge.core.Chat
+import dev.neuroforge.core.ChatKind
+import dev.neuroforge.core.ChatMessage
+import dev.neuroforge.core.Speaker
+import dev.neuroforge.core.modelsFor
 import dev.neuroforge.core.BenchmarkReport
 import dev.neuroforge.core.ModelCatalog
+import dev.neuroforge.core.ModelFile
+import dev.neuroforge.core.ModelRole
+import dev.neuroforge.core.ModelSource
 import dev.neuroforge.core.ModelSpec
 import dev.neuroforge.core.OutputTarget
 import dev.neuroforge.core.RenderPlan
 import dev.neuroforge.core.UpscaleStrategy
 import dev.neuroforge.models.DownloadProgress
+import dev.neuroforge.models.ChatStore
+import dev.neuroforge.models.HfBrowser
 import dev.neuroforge.models.ModelState
+import dev.neuroforge.models.RepoFile
+import dev.neuroforge.runtime.LlmEngine
 import dev.neuroforge.pipeline.GenerationProgress
 import dev.neuroforge.pipeline.GenerationRequest
 import dev.neuroforge.pipeline.GenerationResult
@@ -43,8 +55,19 @@ data class UiState(
   val result: GenerationResult? = null,
   val plan: RenderPlan? = null,
   val diskUsage: Long = 0L,
+
+  val chats: List<Chat> = emptyList(),
+  val activeChatId: String? = null,
+  val replying: Boolean = false,
+
+  val browseRepo: String = "",
+  val browseFiles: List<RepoFile> = emptyList(),
+  val browsing: Boolean = false,
+
   val error: String? = null,
-)
+) {
+  val activeChat: Chat? get() = chats.firstOrNull { it.id == activeChatId }
+}
 
 class AppViewModel(private val app: NeuroForgeApp) : ViewModel() {
 
@@ -74,6 +97,7 @@ class AppViewModel(private val app: NeuroForgeApp) : ViewModel() {
   init {
     refreshDevice()
     refreshModels()
+    loadChats()
     refreshPlan()
   }
 
@@ -108,13 +132,27 @@ class AppViewModel(private val app: NeuroForgeApp) : ViewModel() {
   fun setTarget(t: OutputTarget) { target.value = t; refreshPlan() }
   fun setStrategy(s: UpscaleStrategy) { strategy.value = s; refreshPlan() }
 
+  /**
+   * Downloads everything a model needs, as one action.
+   *
+   * A model is a bundle - weights, a decoder, a tokenizer, metadata - and asking someone to
+   * press four buttons and know which four is a worse interface than one button that
+   * reports which part it is on.
+   */
   fun download(spec: ModelSpec) {
     if (downloadJobs[spec.id]?.isActive == true) return
     downloadJobs[spec.id] = viewModelScope.launch {
       try {
-        spec.files.forEach { file ->
+        spec.files.forEachIndexed { index, file ->
           app.repository.download(spec, file).collect { progress ->
-            _state.update { it.copy(downloads = it.downloads + (spec.id to progress)) }
+            val labelled = progress.copy(
+              fileName = if (spec.files.size > 1) {
+                "${file.fileName} (${index + 1}/${spec.files.size})"
+              } else {
+                file.fileName
+              }
+            )
+            _state.update { it.copy(downloads = it.downloads + (spec.id to labelled)) }
           }
         }
         _state.update { it.copy(downloads = it.downloads - spec.id) }
@@ -206,6 +244,237 @@ class AppViewModel(private val app: NeuroForgeApp) : ViewModel() {
   fun cancelGeneration() {
     generationJob?.cancel()
     _state.update { it.copy(generation = null) }
+  }
+
+  // ---- chats ------------------------------------------------------------------------
+
+  private val chatStore by lazy { ChatStore(app) }
+  private val browser by lazy { HfBrowser() }
+  private var llm: LlmEngine? = null
+  private var loadedLlmModelId: String? = null
+  private var replyJob: Job? = null
+
+  private fun loadChats() {
+    viewModelScope.launch {
+      val stored = chatStore.load()
+      _state.update { it.copy(chats = stored) }
+    }
+  }
+
+  private fun persistChats() {
+    viewModelScope.launch { chatStore.save(_state.value.chats) }
+  }
+
+  /** Models that can drive a chat of this kind and are already downloaded. */
+  fun availableModels(kind: ChatKind): List<ModelSpec> =
+    modelsFor(kind).filter { app.repository.isReady(it) }
+
+  fun createChat(kind: ChatKind, modelId: String) {
+    val chat = Chat(
+      id = "chat-${System.currentTimeMillis()}",
+      kind = kind,
+      modelId = modelId,
+      title = Chat.DEFAULT_TITLE,
+      createdAt = System.currentTimeMillis(),
+    )
+    _state.update { it.copy(chats = listOf(chat) + it.chats, activeChatId = chat.id) }
+    persistChats()
+  }
+
+  fun openChat(id: String?) = _state.update { it.copy(activeChatId = id) }
+
+  fun deleteChat(id: String) {
+    _state.update { s ->
+      s.copy(
+        chats = s.chats.filterNot { it.id == id },
+        activeChatId = if (s.activeChatId == id) null else s.activeChatId,
+      )
+    }
+    persistChats()
+  }
+
+  private fun appendMessage(chatId: String, message: ChatMessage) {
+    _state.update { s ->
+      s.copy(
+        chats = s.chats.map { chat ->
+          if (chat.id != chatId) chat
+          else chat.copy(
+            messages = chat.messages + message,
+            title = chat.copy(messages = chat.messages + message).derivedTitle(),
+          )
+        }
+      )
+    }
+  }
+
+  /** Replaces the last model message, so a streamed reply grows in place. */
+  private fun updateLastModelMessage(chatId: String, text: String) {
+    _state.update { s ->
+      s.copy(
+        chats = s.chats.map { chat ->
+          if (chat.id != chatId || chat.messages.isEmpty()) chat
+          else {
+            val last = chat.messages.last()
+            if (last.speaker != Speaker.MODEL) chat
+            else chat.copy(messages = chat.messages.dropLast(1) + last.copy(text = text))
+          }
+        }
+      )
+    }
+  }
+
+  fun send(text: String) {
+    val chat = _state.value.activeChat ?: return
+    if (text.isBlank() || _state.value.replying) return
+
+    appendMessage(chat.id, ChatMessage(Speaker.USER, text, timestamp = System.currentTimeMillis()))
+
+    replyJob = viewModelScope.launch {
+      _state.update { it.copy(replying = true, error = null) }
+      try {
+        when (chat.kind) {
+          ChatKind.TEXT -> replyWithText(chat, text)
+          ChatKind.IMAGE -> replyWithImage(chat, text)
+          ChatKind.MUSIC -> error(
+            ChatKind.MUSIC.unsupportedReason ?: "Music generation is not available."
+          )
+        }
+      } catch (e: Throwable) {
+        _state.update { it.copy(error = e.message ?: e.javaClass.simpleName) }
+      } finally {
+        _state.update { it.copy(replying = false) }
+        persistChats()
+      }
+    }
+  }
+
+  private suspend fun replyWithText(chat: Chat, prompt: String) {
+    val spec = ModelCatalog.byId(chat.modelId) ?: error("Model ${chat.modelId} is gone")
+    val file = app.repository.fileFor(spec, spec.files.first())
+
+    // The engine holds the conversation, so it is reloaded only when the model changes.
+    if (llm == null || loadedLlmModelId != chat.modelId) {
+      llm?.close()
+      llm = LlmEngine.load(app, file, policy.value)
+      loadedLlmModelId = chat.modelId
+      llm?.startConversation(
+        "You are a concise assistant running entirely on this phone. Keep answers short."
+      )
+    }
+    val engine = llm ?: error("Text engine unavailable")
+
+    val started = System.currentTimeMillis()
+    appendMessage(chat.id, ChatMessage(Speaker.MODEL, "", accelerator = engine.accelerator))
+    val builder = StringBuilder()
+    engine.send(prompt).collect { chunk ->
+      builder.append(chunk)
+      updateLastModelMessage(chat.id, builder.toString())
+    }
+    _state.update { s ->
+      s.copy(
+        chats = s.chats.map { c ->
+          if (c.id != chat.id || c.messages.isEmpty()) c
+          else c.copy(
+            messages = c.messages.dropLast(1) +
+              c.messages.last().copy(millis = System.currentTimeMillis() - started)
+          )
+        }
+      )
+    }
+  }
+
+  private suspend fun replyWithImage(chat: Chat, prompt: String) {
+    val result = app.pipeline.generate(
+      GenerationRequest(
+        prompt = prompt,
+        seed = seed.value,
+        steps = steps.value,
+        target = target.value,
+        strategy = strategy.value,
+        policy = policy.value,
+      )
+    ) { progress -> _state.update { it.copy(generation = progress) } }
+
+    val saved = writePng(result.bitmap)
+    appendMessage(
+      chat.id,
+      ChatMessage(
+        speaker = Speaker.MODEL,
+        text = "${result.bitmap.width}x${result.bitmap.height}",
+        imagePath = saved.absolutePath,
+        accelerator = result.timings.lastOrNull()?.accelerator,
+        millis = result.totalMillis,
+        timestamp = System.currentTimeMillis(),
+      ),
+    )
+    _state.update { it.copy(generation = null, result = result) }
+  }
+
+  fun cancelReply() {
+    replyJob?.cancel()
+    _state.update { it.copy(replying = false, generation = null) }
+  }
+
+  // ---- browsing Hugging Face ----------------------------------------------------------
+
+  fun setBrowseRepo(value: String) = _state.update { it.copy(browseRepo = value) }
+
+  /**
+   * Lists a repository the user named.
+   *
+   * This is the answer to every download failure in this app so far: rather than trusting
+   * a file name someone wrote down, show what is actually there and let it be picked.
+   */
+  fun browse() {
+    val repo = _state.value.browseRepo.trim()
+    if (repo.isBlank() || _state.value.browsing) return
+    viewModelScope.launch {
+      _state.update { it.copy(browsing = true, error = null, browseFiles = emptyList()) }
+      try {
+        val files = browser.list(repo)
+        _state.update { it.copy(browseFiles = files) }
+        if (files.none { it.isModel }) {
+          _state.update {
+            it.copy(error = "No .tflite or .litertlm files in $repo — nothing here to run.")
+          }
+        }
+      } catch (e: Throwable) {
+        _state.update { it.copy(error = e.message ?: "Could not list $repo") }
+      } finally {
+        _state.update { it.copy(browsing = false) }
+      }
+    }
+  }
+
+  /** Downloads one file from a browsed repository into its own model directory. */
+  fun downloadFromRepo(repoId: String, file: RepoFile) {
+    val spec = customSpec(repoId, file)
+    download(spec)
+  }
+
+  private fun customSpec(repoId: String, file: RepoFile): ModelSpec {
+    val name = file.path.substringAfterLast('/')
+    return ModelSpec(
+      id = "custom.${repoId.replace('/', '.')}.${name.substringBeforeLast('.')}",
+      displayName = "$repoId — $name",
+      role = if (name.endsWith(".litertlm", true)) ModelRole.TEXT_CHAT else ModelRole.BENCHMARK,
+      accelerators = listOf(Accel.NPU, Accel.GPU, Accel.CPU),
+      files = listOf(
+        ModelFile(
+          fileName = name,
+          source = ModelSource.HuggingFace(repoId, file.path),
+          sizeBytes = file.sizeBytes,
+        )
+      ),
+      notes = "Added by you from $repoId.",
+    )
+  }
+
+  private fun writePng(bitmap: Bitmap): File {
+    val dir = File(app.filesDir, "renders").apply { mkdirs() }
+    val out = File(dir, "neuroforge_${System.currentTimeMillis()}.png")
+    FileOutputStream(out).use { bitmap.compress(Bitmap.CompressFormat.PNG, 100, it) }
+    return out
   }
 
   fun dismissError() = _state.update { it.copy(error = null) }

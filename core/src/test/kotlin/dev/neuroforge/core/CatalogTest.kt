@@ -74,9 +74,25 @@ class CatalogTest {
 
   @Test
   fun `hugging face urls point at the file inside its repo`() {
+    // The path is the one CI observed in the real repository listing. Every name here was
+    // wrong before that check existed - dit_int4, vae_decoder, text_encoder_int4 - so this
+    // asserts the verified spelling rather than the plausible one.
     assertEquals(
-      "https://huggingface.co/litert-community/Bonsai-Image-ternary-4B/resolve/main/dit_int4.tflite?download=true",
+      "https://huggingface.co/litert-community/Bonsai-Image-ternary-4B/resolve/main/dit_int4b32.tflite?download=true",
       ModelCatalog.BONSAI_DIT.files.single().downloadUrl(),
+    )
+  }
+
+  @Test
+  fun `no size is pinned unless the file was actually inspected`() {
+    // Sizes read off a model card turned a stale catalogue into a dead Download button.
+    // A size may only be a gate when a checksum proves someone downloaded the file.
+    val unverifiedWithSize = ModelCatalog.all
+      .flatMap { it.files }
+      .filter { !it.verified && it.sizeBytes > 0 }
+    assertTrue(
+      unverifiedWithSize.isEmpty(),
+      "these carry an unverified size: ${unverifiedWithSize.map { it.fileName }}",
     )
   }
 

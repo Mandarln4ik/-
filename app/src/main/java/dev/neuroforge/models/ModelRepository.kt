@@ -101,7 +101,9 @@ class ModelRepository(private val context: Context) {
     if (target.isFile) {
       // For an archive the stored size describes the download, not the extracted member,
       // so only a direct download can be length-checked here.
-      if (!file.isArchive && file.sizeBytes > 0 && target.length() != file.sizeBytes) {
+      if (file.verified && !file.isArchive && file.sizeBytes > 0 &&
+        target.length() != file.sizeBytes
+      ) {
         return ModelState.Corrupt(
           "expected ${file.sizeBytes} bytes, found ${target.length()} — delete and re-download"
         )
@@ -173,10 +175,27 @@ class ModelRepository(private val context: Context) {
       emit(DownloadProgress(file.fileName, written, total, rate))
     }
 
-    if (file.sizeBytes > 0 && part.length() != file.sizeBytes) {
+    if (part.length() == 0L) {
       part.delete()
       throw IOException(
-        "${file.fileName}: downloaded ${part.length()} bytes, catalogue expects ${file.sizeBytes}"
+        "${file.fileName}: the server returned an empty body from ${file.originLabel()}. " +
+          "The file may have been renamed or made private."
+      )
+    }
+    // Only a verified entry may reject on size. An unverified sizeBytes came off a model
+    // card, and holding a download to a number nobody checked turns a stale catalogue into
+    // a dead Download button.
+    if (file.verified && file.sizeBytes > 0 && part.length() != file.sizeBytes) {
+      part.delete()
+      throw IOException(
+        "${file.fileName}: downloaded ${part.length()} bytes, expected ${file.sizeBytes}"
+      )
+    }
+    if (!file.verified && file.sizeBytes > 0 && part.length() != file.sizeBytes) {
+      Log.i(
+        TAG,
+        "${file.fileName}: ${part.length()} bytes, catalogue said ${file.sizeBytes} " +
+          "(unverified figure, accepting)",
       )
     }
 
@@ -232,11 +251,16 @@ class ModelRepository(private val context: Context) {
     return "${ModelFile.HF_ENDPOINT}/${source.repoId}/resolve/main/$chosen?download=true"
   }
 
-  /** True when the URL exists; a failed probe is treated as "present" so a flaky network
-   *  does not trigger a pointless listing and a misleading error. */
+  /**
+   * True only when the URL answers 2xx.
+   *
+   * An earlier version accepted anything that was not a 404, which let a 401 on a gated
+   * repository through as "present" and turned an access problem into an empty download.
+   * A failed probe (no network) still counts as present, so a flaky connection does not
+   * trigger a pointless listing and a misleading error.
+   */
   private fun headOk(url: String): Boolean = runCatching {
-    http.newCall(Request.Builder().url(url).head().build()).execute()
-      .use { it.isSuccessful || it.code != 404 }
+    http.newCall(Request.Builder().url(url).head().build()).execute().use { it.isSuccessful }
   }.getOrDefault(true)
 
   /** File paths at the root of a Hugging Face model repository. */
