@@ -82,6 +82,34 @@ fun DeviceScreen(vm: AppViewModel, state: UiState) {
       }
 
       item {
+        SectionCard("What reaches the APU here") {
+          Text(
+            "Three different answers, and only the honest split is useful:",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+          )
+          InfoRow("×4 upscaler", "NPU — static shapes, integer convolutions")
+          InfoRow(
+            "Text model",
+            // Not a claim about this device's silicon but about what is published for it:
+            // litert-community ships graphs compiled per SoC, so the answer depends on
+            // whether one exists for this chip.
+            "NPU via LiteRT-LM, using the ${device.socModel} build if one is published",
+          )
+          InfoRow("Diffusion transformer", "CPU — blockwise int4, dynamic attention")
+          Text(
+            "The Models tab picks the bundle matching ${device.socModel} automatically when " +
+              "a repository publishes per-accelerator builds. Nothing here claims the " +
+              "generator runs on the APU, because no public diffusion model ships as an " +
+              "NPU-compatible LiteRT graph yet.",
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.padding(top = 10.dp),
+          )
+        }
+      }
+
+      item {
         SectionCard("Measure it") {
           Text(
             "Runs the same graph on NPU, GPU and CPU and reports median latency. This is the " +
