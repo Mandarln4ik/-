@@ -95,12 +95,35 @@ jobs:
           find app/build/outputs/apk -name '*.apk' -exec cp {} dist/ \;
           ls -lh dist
 
+      # Whether the release APK is signed depends on a secret being present, which the
+      # hand-written notes cannot know — and getting it wrong means telling people to
+      # install something Android will refuse. So the line is generated from what actually
+      # happened rather than written in advance.
+      - name: Append the signing state to the notes
+        env:
+          KEYSTORE_PATH: ${{ steps.keystore.outputs.path }}
+        run: |
+          cp CHANGELOG.md "$RUNNER_TEMP/notes.md"
+          {
+            echo
+            echo "---"
+            echo
+            if [ -n "$KEYSTORE_PATH" ]; then
+              echo "\`release\` подписан ключом репозитория и обновляется поверх установленного."
+            else
+              echo "> **\`release\` не подписан** — в репозитории не настроен ключ, поэтому Android"
+              echo "> откажется его ставить. Это сборка для тех, кто подпишет её своим ключом."
+              echo "> Всем остальным нужен \`debug\`."
+            fi
+          } >> "$RUNNER_TEMP/notes.md"
+          echo "NOTES_PATH=$RUNNER_TEMP/notes.md" >> "$GITHUB_ENV"
+
       - name: Publish release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.event.inputs.tag || github.ref_name }}
           target_commitish: ${{ github.sha }}
           name: NeuroForge ${{ github.event.inputs.tag || github.ref_name }}
-          body_path: CHANGELOG.md
+          body_path: ${{ env.NOTES_PATH }}
           files: dist/*.apk
           fail_on_unmatched_files: true
