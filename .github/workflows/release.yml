@@ -48,7 +48,10 @@ jobs:
           SDKMANAGER="$(find "$SDK/cmdline-tools" -name sdkmanager -type f | head -1)"
           echo "using $SDKMANAGER"
           yes | "$SDKMANAGER" --licenses > /dev/null 2>&1 || true
-          "$SDKMANAGER" "platforms;android-36" "build-tools;36.0.0"
+          # ndk and cmake are for llama.cpp, compiled from source into libllama_jni.so.
+          # Both versions are pinned in app/build.gradle.kts.
+          "$SDKMANAGER" "platforms;android-36" "build-tools;36.0.0" \
+            "ndk;27.2.12479018" "cmake;3.22.1"
 
       - uses: gradle/actions/setup-gradle@v4
 
@@ -77,6 +80,14 @@ jobs:
       # anyone testing NPU support on their own phone actually needs.
       - name: Assemble debug
         run: ./gradlew :app:assembleDebug --no-daemon
+
+      # The release APK is the only one R8 touches, and the only place a missing keep rule
+      # shows up. The llama.cpp bridge is reached entirely through JNI: its class name is
+      # a string in libllama_jni.so, and TokenSink.onToken is looked up by name with
+      # GetMethodID. Renaming either breaks every GGUF chat in the shipped build while the
+      # debug build CI tests stays fine, so check the shipped one before publishing it.
+      - name: Check R8 kept what JNI needs
+        run: bash ./.github/scripts/check-release-apk.sh
 
       - name: Collect artifacts
         run: |
