@@ -7,8 +7,10 @@ import dev.neuroforge.core.TextBackend
 import java.io.File
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.channels.awaitClose
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.buffer
 import kotlinx.coroutines.flow.callbackFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -113,6 +115,10 @@ class ExecuTorchEngine private constructor(
       job.cancel()
     }
   }
+    // The runtime emits from its own thread while the collector recomposes on the main one.
+    // callbackFlow's default 64-slot channel would start refusing sends part-way through a
+    // long reply, and trySend drops silently - a lost token is a corrupted word.
+    .buffer(Channel.UNLIMITED)
 
   override fun close() {
     runCatching { module.stop() }

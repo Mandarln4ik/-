@@ -4,6 +4,9 @@ build/
 *.apk
 *.aab
 
+# The NDK's CMake tree, including the llama.cpp source FetchContent clones into it
+.cxx/
+
 # Local SDK location, per-machine
 local.properties
 

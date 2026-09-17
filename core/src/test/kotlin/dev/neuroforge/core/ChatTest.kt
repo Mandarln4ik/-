@@ -169,4 +169,27 @@ class ChatTest {
     val line = ReplyStats(ttftMillis = 100, stop = StopReason.CANCELLED).line(Accel.CPU)
     assertTrue(line.contains("stopped by you"), line)
   }
+
+  @Test
+  fun `a counted token total drops the approximately sign`() {
+    // llama.cpp keeps a real count because it owns its decode loop; the other two backends
+    // get a guess from the text, which is routinely a third out. Printing both the same way
+    // would make the exact figure look like the guess.
+    val counted = ReplyStats(ttftMillis = 10, decodeMillis = 1000, tokens = 42,
+                             tokensEstimated = false).line(Accel.CPU)
+    assertTrue(counted.contains(" 42 tok"), counted)
+    assertTrue(!counted.contains("≈"), counted)
+
+    val guessed = ReplyStats(ttftMillis = 10, decodeMillis = 1000, tokens = 42).line(Accel.CPU)
+    assertTrue(guessed.contains("≈42 tok"), guessed)
+  }
+
+  @Test
+  fun `a full context is reported as its own ending`() {
+    // Not the same as finishing, and not the same as an error: the next step is a new chat
+    // or a bigger window, and neither of the other two labels suggests that.
+    val line = ReplyStats(ttftMillis = 10, tokens = 5, stop = StopReason.CONTEXT_FULL)
+      .line(Accel.CPU)
+    assertTrue(line.contains("context full"), line)
+  }
 }

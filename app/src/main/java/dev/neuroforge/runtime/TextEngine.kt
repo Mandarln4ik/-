@@ -3,6 +3,7 @@ package dev.neuroforge.runtime
 import android.content.Context
 import dev.neuroforge.core.Accel
 import dev.neuroforge.core.AcceleratorPolicy
+import dev.neuroforge.core.StopReason
 import dev.neuroforge.core.TextBackend
 import dev.neuroforge.core.backendFor
 import java.io.File
@@ -45,6 +46,19 @@ interface TextEngine : AutoCloseable {
   /** Per-backend failures on the way to the one that worked, already in plain words. */
   val attempts: List<String>
 
+  /**
+   * Why the last [send] ended, when the runtime says so rather than just closing the stream.
+   *
+   * Only llama.cpp reports one today: it is the only backend here that owns the decode loop,
+   * so it is the only one that can tell "the model emitted end-of-turn" from "there was no
+   * KV slot left". Null means the caller should fall back to inferring it, which is what an
+   * empty reply or a thrown exception already gives it.
+   */
+  val lastStop: StopReason? get() = null
+
+  /** Tokens in the last reply, counted rather than estimated. 0 when the backend cannot say. */
+  val lastTokens: Int get() = 0
+
   /** Starts a fresh conversation, discarding any previous one. */
   suspend fun startConversation(systemPrompt: String, sampling: SamplingOptions)
 
@@ -81,10 +95,7 @@ object TextEngines {
     TextBackend.EXECUTORCH ->
       ExecuTorchEngine.load(modelFile, tokenizerFile, contextTokens, sampling, onProgress)
 
-    TextBackend.LLAMA_CPP -> error(
-      "llama.cpp is not built into this APK yet, so ${modelFile.name} cannot be opened. " +
-        "It needs a native build of llama.cpp shipped with the app; until then, use a " +
-        ".litertlm or .pte model."
-    )
+    TextBackend.LLAMA_CPP ->
+      LlamaCppEngine.load(modelFile, contextTokens, sampling, onProgress)
   }
 }

@@ -563,12 +563,79 @@ object ModelCatalog {
       "PyTorch export against the LiteRT path, not to go faster.",
   )
 
+
+  /**
+   * Gemma 3 1B as GGUF, so the same model can be run on two different runtimes.
+   *
+   * That is most of why it is here. [LLM_GEMMA3_1B] is the same weights as a `.litertlm`
+   * bundle that reaches the APU; this is the llama.cpp path on the CPU. Switching the
+   * backend in Settings and asking both the same question is the only honest way to see
+   * what the NPU is actually buying, and it needs the model held constant.
+   *
+   * The conversion is ggml's own rather than a community re-quantisation, and it is not
+   * behind the Gemma licence gate the way Google's own repository is.
+   */
+  val LLM_GEMMA3_1B_GGUF = ModelSpec(
+    id = "llm.gemma3_1b_it_gguf",
+    displayName = "Gemma 3 1B Instruct (GGUF)",
+    role = ModelRole.TEXT_CHAT,
+    accelerators = listOf(Accel.CPU),
+    files = listOf(
+      ModelFile(
+        fileName = "gemma3_1b_it_q4_k_m.gguf",
+        source = ModelSource.HuggingFace(
+          repoId = "ggml-org/gemma-3-1b-it-GGUF",
+          path = "gemma-3-1b-it-Q4_K_M.gguf",
+          // A GGUF repository publishes a dozen quantisations of one model, so the ranking
+          // has to separate them rather than just find the family. Three overlapping hints
+          // score Q4_K_M above Q4_K_S above Q4_0, which is the order worth having on a
+          // phone: K-quants at 4 bits are the usual quality-per-byte sweet spot.
+          hints = listOf("q4_k_m", "q4_k", "q4"),
+        ),
+        sizeBytes = 0L,
+      )
+    ),
+    notes = "The same weights as the LiteRT Gemma 3 1B entry, in llama.cpp's format. Run " +
+      "both and compare: this one is CPU, the other reaches the APU.",
+  )
+
+  /**
+   * Qwen 2.5 0.5B as GGUF, from Qwen's own repository.
+   *
+   * The smallest thing here that still holds a conversation, and the counterpart to
+   * [LLM_QWEN25_05B_PTE] in the same way the Gemma pair works — same weights, different
+   * runtime. It is also a ChatML model, where Gemma is not, so between the two of them
+   * llama.cpp's chat templating is exercised on both of the families it is most likely to
+   * meet.
+   */
+  val LLM_QWEN25_05B_GGUF = ModelSpec(
+    id = "llm.qwen25_0_5b_gguf",
+    displayName = "Qwen2.5 0.5B Instruct (GGUF)",
+    role = ModelRole.TEXT_CHAT,
+    accelerators = listOf(Accel.CPU),
+    files = listOf(
+      ModelFile(
+        fileName = "qwen25_0_5b_instruct_q4_k_m.gguf",
+        source = ModelSource.HuggingFace(
+          repoId = "Qwen/Qwen2.5-0.5B-Instruct-GGUF",
+          path = "qwen2.5-0.5b-instruct-q4_k_m.gguf",
+          hints = listOf("q4_k_m", "q4_k", "q4"),
+        ),
+        sizeBytes = 0L,
+      )
+    ),
+    notes = "Around 400 MiB and ungated. Small enough to be the first thing to try on the " +
+      "llama.cpp backend, and small enough that its answers show it.",
+  )
+
   /** Everything, for the model-manager screen. */
   val all: List<ModelSpec> = listOf(
     BENCHMARK_MOBILENET,
     LLM_GEMMA3_1B,
     LLM_QWEN3_06B,
     LLM_QWEN25_05B_PTE,
+    LLM_GEMMA3_1B_GGUF,
+    LLM_QWEN25_05B_GGUF,
     UPSCALER_ESRGAN_X4,
     BONSAI_TEXT_ENCODER,
     BONSAI_DIT,

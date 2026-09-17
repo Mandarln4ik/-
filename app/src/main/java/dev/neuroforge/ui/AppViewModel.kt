@@ -572,6 +572,13 @@ class AppViewModel(private val app: NeuroForgeApp) : ViewModel() {
     } finally {
       val done = SystemClock.elapsedRealtime()
       val (thinking, answer) = splitThinking(raw.toString())
+      // A backend that owns its decode loop knows why it stopped; the guesses below are
+      // only for the ones that just close the stream. An exception already set `stop`, so
+      // this never overrides a real failure with the runtime's own tidier account of it.
+      if (stop == StopReason.COMPLETE) {
+        llm?.lastStop?.let { stop = it }
+      }
+      val counted = llm?.lastTokens?.takeIf { it > 0 }
       if (raw.isEmpty() && stop == StopReason.COMPLETE) {
         stop = StopReason.EMPTY
         detail = "The model produced no output. That usually means the context filled up - " +
@@ -582,9 +589,12 @@ class AppViewModel(private val app: NeuroForgeApp) : ViewModel() {
         ReplyStats(
           ttftMillis = if (firstToken > 0) firstToken - sent else done - sent,
           decodeMillis = if (firstToken > 0) done - firstToken else 0,
-          tokens = estimateTokens(answer) + estimateTokens(thinking.orEmpty()),
+          // Counted when the backend counts them, estimated otherwise - which is why
+          // the label carries a tilde only in the second case.
+          tokens = counted ?: (estimateTokens(answer) + estimateTokens(thinking.orEmpty())),
           stop = stop,
           detail = detail,
+          tokensEstimated = counted == null,
         ),
         done - sent,
       )

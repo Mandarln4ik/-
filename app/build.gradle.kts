@@ -14,12 +14,23 @@ android {
     // 31 is where Build.SOC_MODEL arrives, and it is the floor the LiteRT NPU samples use.
     minSdk = 31
     targetSdk = 36
-    versionCode = 5
-    versionName = "1.2.0"
+    versionCode = 6
+    versionName = "1.3.0"
 
     // The NPU accelerators ship arm64 only; shipping other ABIs would only grow the APK
     // with builds that can never reach the hardware this app exists for.
     ndk { abiFilters.add("arm64-v8a") }
+
+    // llama.cpp is compiled from source into libllama_jni.so. See src/main/cpp/CMakeLists.txt
+    // for what each flag buys; -PllamaArmArch overrides the instruction-set baseline for a
+    // build that only has to run on one known phone.
+    externalNativeBuild {
+      cmake {
+        arguments += "-DCMAKE_BUILD_TYPE=Release"
+        arguments += "-DGGML_CPU_ARM_ARCH=" +
+          (project.findProperty("llamaArmArch") as String? ?: "armv8.2-a+dotprod+fp16")
+      }
+    }
   }
 
   // Release signing is opt-in via environment variables, so CI can sign when the repository
@@ -52,6 +63,17 @@ android {
     sourceCompatibility = JavaVersion.VERSION_11
     targetCompatibility = JavaVersion.VERSION_11
   }
+
+  externalNativeBuild {
+    cmake {
+      path = file("src/main/cpp/CMakeLists.txt")
+      version = "3.22.1"
+    }
+  }
+
+  // Pinned rather than left to AGP's default so CI installs exactly what the build wants;
+  // an unpinned NDK is a build that breaks when the runner image rolls.
+  ndkVersion = "27.2.12479018"
 
   buildFeatures { compose = true }
 

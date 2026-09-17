@@ -31,7 +31,11 @@ enum class StopReason(val label: String) {
  *   prefill and any just-in-time graph compilation land, so it is often most of a short
  *   reply's wall clock and is worth separating from the decode rate.
  * @param decodeMillis time from the first token to the last.
- * @param tokens estimated, not measured — see [estimateTokens].
+ * @param tokens how many tokens the reply came to.
+ * @param tokensEstimated whether [tokens] is a guess from the text — see [estimateTokens] —
+ *   or a count the runtime kept. Only llama.cpp keeps one, because it is the only backend
+ *   here that owns its decode loop. The difference shows up as the `≈` in [line]: a figure
+ *   that is off by a third and one that is exact should not be printed the same way.
  */
 data class ReplyStats(
   val ttftMillis: Long = 0,
@@ -39,6 +43,7 @@ data class ReplyStats(
   val tokens: Int = 0,
   val stop: StopReason = StopReason.COMPLETE,
   val detail: String? = null,
+  val tokensEstimated: Boolean = true,
 ) {
   val totalMillis: Long get() = ttftMillis + decodeMillis
 
@@ -51,7 +56,7 @@ data class ReplyStats(
     accelerator?.let { append(it.name).append(" · ") }
     append("${ttftMillis}ms to first token")
     if (tokens > 0) {
-      append(" · ≈$tokens tok")
+      append(if (tokensEstimated) " · ≈$tokens tok" else " · $tokens tok")
       if (tokensPerSecond > 0) append(" · %.1f tok/s".format(tokensPerSecond))
     }
     if (stop != StopReason.COMPLETE) append(" · ${stop.label}")
