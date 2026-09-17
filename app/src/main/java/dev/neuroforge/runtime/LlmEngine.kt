@@ -1,24 +1,39 @@
 package dev.neuroforge.runtime
 
 import android.content.Context
+import android.os.SystemClock
 import android.util.Log
 import com.google.ai.edge.litertlm.Backend
+import com.google.ai.edge.litertlm.Content
 import com.google.ai.edge.litertlm.Contents
 import com.google.ai.edge.litertlm.Conversation
 import com.google.ai.edge.litertlm.ConversationConfig
 import com.google.ai.edge.litertlm.Engine
 import com.google.ai.edge.litertlm.EngineConfig
 import com.google.ai.edge.litertlm.Message
-import com.google.ai.edge.litertlm.MessageCallback
 import com.google.ai.edge.litertlm.SamplerConfig
 import dev.neuroforge.core.Accel
 import dev.neuroforge.core.AcceleratorPolicy
+import dev.neuroforge.core.explainLlmFailure
 import java.io.File
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.channels.awaitClose
 import kotlinx.coroutines.flow.Flow
-import kotlinx.coroutines.flow.callbackFlow
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.withContext
+
+/** Where a model load has got to. There is no percentage to report; see [LlmEngine.load]. */
+data class LlmLoadProgress(
+  val stage: String,
+  val elapsedMillis: Long,
+  val tried: List<String> = emptyList(),
+)
+
+/** How a chat is sampled. Mirrors LiteRT-LM's `SamplerConfig`. */
+data class SamplingOptions(
+  val temperature: Double = 0.7,
+  val topK: Int = 40,
+  val topP: Double = 0.9,
+)
 
 /**
  * A loaded text model and one conversation on it.
@@ -30,9 +45,14 @@ import kotlinx.coroutines.withContext
  * can.
  *
  * @param accelerator the backend that actually accepted the model, not the one requested.
+ * @param contextTokens the window the engine was configured with, for the context gauge.
+ * @param loadMillis how long [load] took, including any just-in-time NPU compilation.
  */
 class LlmEngine private constructor(
   val accelerator: Accel,
+  val contextTokens: Int,
+  val loadMillis: Long,
+  val attempts: List<String>,
   private val engine: Engine,
 ) : AutoCloseable {
 
@@ -46,41 +66,41 @@ class LlmEngine private constructor(
    */
   suspend fun startConversation(
     systemPrompt: String,
-    temperature: Double = 0.7,
-    topK: Int = 40,
-    topP: Double = 0.9,
+    sampling: SamplingOptions = SamplingOptions(),
   ): Unit = withContext(Dispatchers.IO) {
     closeConversation()
     conversation = engine.createConversation(
       ConversationConfig(
         systemInstruction = Contents.of(systemPrompt),
-        samplerConfig = SamplerConfig(temperature = temperature, topK = topK, topP = topP),
+        samplerConfig = SamplerConfig(
+          temperature = sampling.temperature,
+          topK = sampling.topK,
+          topP = sampling.topP,
+        ),
       )
     )
   }
 
-  /** Streams the reply token group by token group. */
-  fun send(prompt: String): Flow<String> = callbackFlow {
-    val conv = conversation
-    if (conv == null) {
-      close(IllegalStateException("No conversation started"))
-      return@callbackFlow
-    }
-    conv.sendMessageAsync(prompt, object : MessageCallback {
-      override fun onMessage(message: Message) {
-        trySend(message.toString())
-      }
-
-      override fun onDone() {
-        close()
-      }
-
-      override fun onError(throwable: Throwable) {
-        close(throwable)
-      }
-    })
-    awaitClose { }
+  /**
+   * Streams the reply as text deltas.
+   *
+   * Each [Message] carries a list of [Content] parts, and only the text ones mean anything
+   * in a chat. An earlier version of this called `toString()` on the message, which is not a
+   * subtly worse rendering — it puts the data class's own debug representation into the
+   * conversation instead of the model's words.
+   */
+  fun send(prompt: String): Flow<String> {
+    val conv = conversation ?: error("No conversation started")
+    return conv.sendMessageAsync(prompt).map { it.text() }
   }
+
+  private fun Message.text(): String =
+    contents.contents.joinToString("") { part ->
+      when (part) {
+        is Content.Text -> part.text
+        else -> ""
+      }
+    }
 
   private fun closeConversation() {
     runCatching { conversation?.close() }
@@ -98,6 +118,12 @@ class LlmEngine private constructor(
     /**
      * Loads [modelFile], trying the backends [policy] allows in order.
      *
+     * [onProgress] reports a stage and an elapsed time, not a percentage: `initialize()` is
+     * one blocking native call with no progress channel, and inventing a bar that advances
+     * on a timer would be a decoration rather than information. The elapsed figure is worth
+     * showing because the first NPU load can include just-in-time graph compilation and
+     * takes tens of seconds, which is otherwise indistinguishable from a hang.
+     *
      * Reaching the NPU needs the vendor runtime on the loader's search path, which is not
      * set for a normal app process — hence [configureNativeRuntime]. Without it the NPU
      * backend fails to initialise for a reason that looks nothing like "library not found".
@@ -106,8 +132,12 @@ class LlmEngine private constructor(
       context: Context,
       modelFile: File,
       policy: AcceleratorPolicy = AcceleratorPolicy.AUTO,
+      contextTokens: Int = 2048,
+      onProgress: (LlmLoadProgress) -> Unit = {},
     ): LlmEngine = withContext(Dispatchers.IO) {
       require(modelFile.isFile) { "model file missing: ${modelFile.absolutePath}" }
+      val started = SystemClock.elapsedRealtime()
+      fun elapsed() = SystemClock.elapsedRealtime() - started
 
       val libDir = context.applicationInfo.nativeLibraryDir
       val targets = policy.order
@@ -115,6 +145,7 @@ class LlmEngine private constructor(
 
       val failures = mutableListOf<String>()
       for (accel in targets) {
+        onProgress(LlmLoadProgress("Loading on $accel", elapsed(), failures.toList()))
         val backend = when (accel) {
           Accel.NPU -> Backend.NPU(nativeLibraryDir = libDir)
           Accel.GPU -> Backend.GPU()
@@ -125,6 +156,9 @@ class LlmEngine private constructor(
             EngineConfig(
               modelPath = modelFile.absolutePath,
               backend = backend,
+              maxNumTokens = contextTokens,
+              // Required for just-in-time compilation; without it the NPU backend has
+              // nowhere to put the graph it builds and fails on every load.
               cacheDir = context.cacheDir.path,
             )
           )
@@ -133,16 +167,23 @@ class LlmEngine private constructor(
         }
         attempt.fold(
           onSuccess = {
-            Log.i(TAG, "${modelFile.name} -> $accel")
-            return@withContext LlmEngine(accel, it)
+            Log.i(TAG, "${modelFile.name} -> $accel in ${elapsed()} ms")
+            onProgress(LlmLoadProgress("Ready on $accel", elapsed(), failures.toList()))
+            return@withContext LlmEngine(
+              accel, contextTokens, elapsed(), failures.toList(), it,
+            )
           },
           onFailure = { e ->
-            failures += "$accel=${e.message ?: e.javaClass.simpleName}"
-            Log.w(TAG, "${modelFile.name} rejected by $accel", e)
+            val explained = explainLlmFailure(accel, e.message)
+            failures += explained
+            Log.w(TAG, "${modelFile.name} rejected by $accel: $explained", e)
           },
         )
       }
-      error("No backend loaded ${modelFile.name}. Tried: ${failures.joinToString("; ")}")
+      error(
+        "No backend loaded ${modelFile.name} after ${elapsed()} ms.\n" +
+          failures.joinToString("\n")
+      )
     }
 
     @Volatile private var nativeRuntimeConfigured = false

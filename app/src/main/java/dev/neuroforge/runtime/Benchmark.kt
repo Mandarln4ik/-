@@ -85,7 +85,7 @@ object Benchmark {
       repeat(warmup + iterations) {
         coroutineContext.ensureActive()
         session.writeInputForTiming(0, input)
-        samples += session.run().toDouble()
+        samples += session.run()
       }
 
       return summarize(spec.displayName, accel, samples, warmup)

@@ -55,9 +55,20 @@ data class BenchmarkResult(
 
   fun summary(): String = when {
     failed != null -> "$label / $accelerator: FAILED — $failed"
-    else -> "$label / $accelerator: median %.2f ms (p95 %.2f, best %.2f), %.1f inf/s, warmup %.0f ms"
+    else -> "$label / $accelerator: median %.3f ms (p95 %.3f, best %.3f), %.1f inf/s, warmup %.0f ms"
       .format(median, p95, best, throughput, warmupMillis)
   }
+
+  /**
+   * True when every sample landed on the same whole millisecond.
+   *
+   * The signature of a clock that cannot see the thing being measured. It is worth calling
+   * out rather than reporting the resulting 1.00x speedup as a finding: this app shipped
+   * exactly that, and it read as "the NPU is no faster" when it meant "the timer has
+   * millisecond resolution and the graph takes about two of them".
+   */
+  val quantised: Boolean
+    get() = samples.size > 1 && samples.all { it == kotlin.math.floor(it) }
 }
 
 /** A whole comparison run: the same model across every accelerator that would load it. */
@@ -80,18 +91,53 @@ data class BenchmarkReport(val results: List<BenchmarkResult>) {
   }
 
   fun table(): String = buildString {
-    appendLine("%-10s %10s %10s %10s %10s".format("accel", "median", "p95", "best", "inf/s"))
+    appendLine("%-6s %10s %10s %10s %9s %8s".format("accel", "median", "p95", "best", "inf/s", "± sd"))
     results.forEach { r ->
       if (r.ok) {
         appendLine(
-          "%-10s %9.2fms %9.2fms %9.2fms %10.1f"
-            .format(r.accelerator.name, r.median, r.p95, r.best, r.throughput)
+          "%-6s %8.3fms %8.3fms %8.3fms %9.1f %7.3f"
+            .format(r.accelerator.name, r.median, r.p95, r.best, r.throughput, r.stdDev)
         )
       } else {
-        appendLine("%-10s %s".format(r.accelerator.name, r.failed ?: "no samples"))
+        appendLine("%-6s %s".format(r.accelerator.name, r.failed ?: "no samples"))
       }
     }
     npuSpeedupOverCpu()?.let { appendLine("NPU speedup over CPU: %.2fx".format(it)) }
+    interpretation()?.let { appendLine(it) }
+  }
+
+  /**
+   * What the numbers mean, when they mean something other than what they look like.
+   *
+   * A ratio near 1.00 has three quite different causes and the user cannot tell them apart
+   * from the ratio alone: the clock could not resolve the difference, the two results
+   * overlap inside their own spread, or the NPU genuinely does not help on this graph. The
+   * third is a real and useful finding; the first two are not findings at all.
+   */
+  fun interpretation(): String? {
+    val npu = results.firstOrNull { it.accelerator == Accel.NPU && it.ok } ?: return null
+    val cpu = results.firstOrNull { it.accelerator == Accel.CPU && it.ok } ?: return null
+
+    if (npu.quantised && cpu.quantised) {
+      return "Every sample was a whole millisecond, so this graph is too quick for the " +
+        "clock here. Benchmark something heavier - the upscaler - for a number that means " +
+        "anything."
+    }
+
+    val gap = kotlin.math.abs(cpu.median - npu.median)
+    val noise = npu.stdDev + cpu.stdDev
+    if (gap < noise) {
+      return "The gap (%.3f ms) is smaller than the run-to-run spread (%.3f ms), so these two are tied, not equal."
+        .format(gap, noise)
+    }
+
+    val speedup = cpu.median / npu.median
+    return when {
+      speedup >= 1.2 -> "The NPU is %.2fx faster than the CPU here.".format(speedup)
+      speedup <= 0.83 -> "The CPU is %.2fx faster than the NPU here - this graph is not one an APU accelerates."
+        .format(1.0 / speedup)
+      else -> "The NPU and CPU are within 20%% of each other on this graph."
+    }
   }
 }
 

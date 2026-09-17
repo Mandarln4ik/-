@@ -5,7 +5,6 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Memory
-import androidx.compose.material.icons.filled.AutoAwesome
 import androidx.compose.material.icons.filled.Download
 import androidx.compose.material.icons.filled.Tune
 import androidx.compose.material.icons.filled.Forum
@@ -29,9 +28,16 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 
+/**
+ * Four tabs, not five.
+ *
+ * Image generation used to have its own, which split one activity across two screens: the
+ * prompt was typed in one place and the picture appeared in another, with the seed that
+ * produced it on a third. It now lives in the image chat, where the prompt, the settings
+ * and the result are the same conversation.
+ */
 private enum class Tab(val label: String, val icon: ImageVector) {
   CHATS("Chats", Icons.Filled.Forum),
-  GENERATE("Generate", Icons.Filled.AutoAwesome),
   DEVICE("Device", Icons.Filled.Memory),
   MODELS("Models", Icons.Filled.Download),
   SETTINGS("Settings", Icons.Filled.Tune),
@@ -86,7 +92,6 @@ fun NeuroForgeUi(vm: AppViewModel) {
     Column(Modifier.padding(padding)) {
       when (tab) {
         Tab.CHATS -> ChatsScreen(vm, state)
-        Tab.GENERATE -> GenerateScreen(vm, state)
         Tab.DEVICE -> DeviceScreen(vm, state)
         Tab.MODELS -> ModelsScreen(vm, state)
         Tab.SETTINGS -> SettingsScreen(vm, state)

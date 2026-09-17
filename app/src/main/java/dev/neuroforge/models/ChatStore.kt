@@ -6,7 +6,9 @@ import dev.neuroforge.core.Accel
 import dev.neuroforge.core.Chat
 import dev.neuroforge.core.ChatKind
 import dev.neuroforge.core.ChatMessage
+import dev.neuroforge.core.ReplyStats
 import dev.neuroforge.core.Speaker
+import dev.neuroforge.core.StopReason
 import java.io.File
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -65,6 +67,19 @@ class ChatStore(context: Context) {
                     m.accelerator?.let { put("accelerator", it.name) }
                     put("millis", m.millis)
                     put("timestamp", m.timestamp)
+                    m.thinking?.let { put("thinking", it) }
+                    m.stats?.let { st ->
+                      put(
+                        "stats",
+                        JSONObject().apply {
+                          put("ttft", st.ttftMillis)
+                          put("decode", st.decodeMillis)
+                          put("tokens", st.tokens)
+                          put("stop", st.stop.name)
+                          st.detail?.let { put("detail", it) }
+                        },
+                      )
+                    }
                   }
                 )
               }
@@ -91,6 +106,18 @@ class ChatStore(context: Context) {
             accelerator = enumOrNull<Accel>(m.optString("accelerator")),
             millis = m.optLong("millis"),
             timestamp = m.optLong("timestamp"),
+            thinking = m.optString("thinking").takeIf { it.isNotBlank() },
+            // Absent for every reply written before this was recorded; the UI simply shows
+            // no telemetry line for those rather than inventing zeroes.
+            stats = m.optJSONObject("stats")?.let { st ->
+              ReplyStats(
+                ttftMillis = st.optLong("ttft"),
+                decodeMillis = st.optLong("decode"),
+                tokens = st.optInt("tokens"),
+                stop = enumOrNull<StopReason>(st.optString("stop")) ?: StopReason.COMPLETE,
+                detail = st.optString("detail").takeIf { d -> d.isNotBlank() },
+              )
+            },
           )
         }
       }.orEmpty()

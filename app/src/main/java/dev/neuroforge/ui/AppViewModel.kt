@@ -2,6 +2,8 @@ package dev.neuroforge.ui
 
 import android.app.Application
 import android.graphics.Bitmap
+import android.os.SystemClock
+import android.util.Log
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import androidx.lifecycle.viewmodel.initializer
@@ -16,6 +18,13 @@ import dev.neuroforge.core.ChatMessage
 import dev.neuroforge.core.Speaker
 import dev.neuroforge.core.modelsFor
 import dev.neuroforge.core.BenchmarkReport
+import dev.neuroforge.core.ContextBudget
+import dev.neuroforge.core.ReplyStats
+import dev.neuroforge.core.StopReason
+import dev.neuroforge.core.contextUsed
+import dev.neuroforge.core.estimateTokens
+import dev.neuroforge.core.mostRecentFirst
+import dev.neuroforge.core.splitThinking
 import dev.neuroforge.core.ModelCatalog
 import dev.neuroforge.core.ModelFile
 import dev.neuroforge.core.ModelRole
@@ -30,6 +39,8 @@ import dev.neuroforge.models.HfBrowser
 import dev.neuroforge.models.ModelState
 import dev.neuroforge.models.RepoFile
 import dev.neuroforge.runtime.LlmEngine
+import dev.neuroforge.runtime.LlmLoadProgress
+import dev.neuroforge.runtime.SamplingOptions
 import dev.neuroforge.pipeline.GenerationProgress
 import dev.neuroforge.pipeline.GenerationRequest
 import dev.neuroforge.pipeline.GenerationResult
@@ -38,6 +49,7 @@ import dev.neuroforge.runtime.Benchmark
 import dev.neuroforge.runtime.DeviceReport
 import java.io.File
 import java.io.FileOutputStream
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -54,13 +66,18 @@ data class UiState(
   val benchmarkRunning: Boolean = false,
   val benchmarkModel: String? = null,
   val generation: GenerationProgress? = null,
-  val result: GenerationResult? = null,
   val plan: RenderPlan? = null,
   val diskUsage: Long = 0L,
 
   val chats: List<Chat> = emptyList(),
   val activeChatId: String? = null,
   val replying: Boolean = false,
+
+  /** Where the text engine has got to while loading; null once it is ready or idle. */
+  val llmLoad: LlmLoadProgress? = null,
+
+  /** Context window the loaded engine opened, for the gauge above the input. */
+  val llmContextTokens: Int = 0,
 
   val browseRepo: String = "",
   val browseFiles: List<RepoFile> = emptyList(),
@@ -69,6 +86,30 @@ data class UiState(
   val error: String? = null,
 ) {
   val activeChat: Chat? get() = chats.firstOrNull { it.id == activeChatId }
+
+  /** Conversations in the order to list them: the one being worked on first. */
+  val orderedChats: List<Chat> get() = chats.mostRecentFirst()
+
+  /**
+   * How much of the context window the active conversation has spent.
+   *
+   * Null until a model has actually loaded, because the limit comes from the engine rather
+   * than from the setting: a model can refuse the requested window and open a smaller one,
+   * and a gauge drawn against a number the engine did not accept would be fiction.
+   */
+  val contextBudget: ContextBudget?
+    get() {
+      val chat = activeChat ?: return null
+      if (chat.kind != ChatKind.TEXT || llmContextTokens <= 0) return null
+      val parts = chat.messages.flatMap { listOfNotNull(it.text, it.thinking) }
+      return ContextBudget(contextUsed(SYSTEM_PROMPT, parts), llmContextTokens)
+    }
+
+  companion object {
+    /** Kept here so the context estimate counts the same prompt the engine was given. */
+    const val SYSTEM_PROMPT =
+      "You are a concise assistant running entirely on this phone. Keep answers short."
+  }
 }
 
 class AppViewModel(private val app: NeuroForgeApp) : ViewModel() {
@@ -76,9 +117,9 @@ class AppViewModel(private val app: NeuroForgeApp) : ViewModel() {
   private val _state = MutableStateFlow(UiState())
   val state: StateFlow<UiState> = _state.asStateFlow()
 
-  // Prompt settings live outside UiState: they change on every keystroke, and folding them
-  // into the same object would recompose the device panel and the model list too.
-  val prompt = MutableStateFlow("a red fox sitting in fresh snow at sunrise, cinematic light")
+  // Generation settings live outside UiState: they change on every drag of a slider, and
+  // folding them into the same object would recompose the device panel and the model list
+  // too. The prompt itself is the chat's draft, not a setting.
   val seed = MutableStateFlow(7L)
   // The count the model was step-distilled for. Named rather than typed so the UI default
   // and the pipeline default cannot drift apart.
@@ -94,6 +135,15 @@ class AppViewModel(private val app: NeuroForgeApp) : ViewModel() {
    * to survive the app being killed mid-download.
    */
   val policy = MutableStateFlow(loadPolicy())
+
+  // ---- Inference settings -------------------------------------------------------------
+  // These four are what LiteRT-LM actually exposes: `maxNumTokens` on the engine and the
+  // three sampler fields on the conversation. There is deliberately no KV-cache dtype among
+  // them; the Settings screen says why it cannot be one.
+  val contextTokens = MutableStateFlow(prefs().getInt(KEY_CONTEXT, 2048))
+  val temperature = MutableStateFlow(prefs().getFloat(KEY_TEMPERATURE, 0.7f).toDouble())
+  val topK = MutableStateFlow(prefs().getInt(KEY_TOP_K, 40))
+  val topP = MutableStateFlow(prefs().getFloat(KEY_TOP_P, 0.9f).toDouble())
 
   /**
    * Hugging Face access token, for gated and private repositories.
@@ -283,28 +333,6 @@ class AppViewModel(private val app: NeuroForgeApp) : ViewModel() {
     }
   }
 
-  fun generate() {
-    if (generationJob?.isActive == true) return
-    generationJob = viewModelScope.launch {
-      _state.update { it.copy(error = null, result = null) }
-      try {
-        val result = app.pipeline.generate(
-          GenerationRequest(
-            prompt = prompt.value,
-            seed = seed.value,
-            steps = steps.value,
-            target = target.value,
-            strategy = strategy.value,
-            policy = policy.value,
-          )
-        ) { progress -> _state.update { it.copy(generation = progress) } }
-        _state.update { it.copy(result = result, generation = null) }
-      } catch (e: Throwable) {
-        _state.update { it.copy(error = e.message ?: e.javaClass.simpleName, generation = null) }
-      }
-    }
-  }
-
   /** Models the benchmark can drive, most appropriate first. */
   fun benchmarkable(): List<ModelSpec> =
     listOf(ModelCatalog.BENCHMARK_MOBILENET, ModelCatalog.UPSCALER_ESRGAN_X4)
@@ -375,7 +403,7 @@ class AppViewModel(private val app: NeuroForgeApp) : ViewModel() {
   }
 
   /** Replaces the last model message, so a streamed reply grows in place. */
-  private fun updateLastModelMessage(chatId: String, text: String) {
+  private fun updateLastModelMessage(chatId: String, text: String, thinking: String? = null) {
     _state.update { s ->
       s.copy(
         chats = s.chats.map { chat ->
@@ -383,11 +411,54 @@ class AppViewModel(private val app: NeuroForgeApp) : ViewModel() {
           else {
             val last = chat.messages.last()
             if (last.speaker != Speaker.MODEL) chat
-            else chat.copy(messages = chat.messages.dropLast(1) + last.copy(text = text))
+            else chat.copy(
+              messages = chat.messages.dropLast(1) + last.copy(text = text, thinking = thinking)
+            )
           }
         }
       )
     }
+  }
+
+  /** Writes the telemetry onto the reply that has just finished streaming. */
+  private fun finishLastModelMessage(
+    chatId: String,
+    answer: String,
+    thinking: String?,
+    stats: ReplyStats,
+    millis: Long,
+  ) {
+    _state.update { s ->
+      s.copy(
+        chats = s.chats.map { c ->
+          if (c.id != chatId || c.messages.isEmpty()) c
+          else c.copy(
+            messages = c.messages.dropLast(1) + c.messages.last().copy(
+              text = answer, thinking = thinking, stats = stats, millis = millis,
+            )
+          )
+        }
+      )
+    }
+  }
+
+  /**
+   * Forgets a conversation.
+   *
+   * Also drops the engine when the deleted chat was the one it was loaded for: the engine
+   * owns the KV cache for that conversation, and keeping it alive would have the next chat
+   * on the same model inherit turns that no longer exist anywhere in the UI.
+   */
+  fun deleteChat(id: String) {
+    val chat = _state.value.chats.firstOrNull { it.id == id }
+    if (chat != null && chat.modelId == loadedLlmModelId) reloadEngine()
+    _state.update { s ->
+      s.copy(
+        chats = s.chats.filterNot { it.id == id },
+        activeChatId = if (s.activeChatId == id) null else s.activeChatId,
+      )
+    }
+    persistChats()
   }
 
   fun send(text: String) {
@@ -422,30 +493,79 @@ class AppViewModel(private val app: NeuroForgeApp) : ViewModel() {
     // The engine holds the conversation, so it is reloaded only when the model changes.
     if (llm == null || loadedLlmModelId != chat.modelId) {
       llm?.close()
-      llm = LlmEngine.load(app, file, policy.value)
+      llm = null
+      loadedLlmModelId = null
+      try {
+        llm = LlmEngine.load(
+          context = app,
+          modelFile = file,
+          policy = policy.value,
+          contextTokens = contextTokens.value,
+        ) { progress -> _state.update { it.copy(llmLoad = progress) } }
+      } finally {
+        _state.update { it.copy(llmLoad = null) }
+      }
       loadedLlmModelId = chat.modelId
       llm?.startConversation(
-        "You are a concise assistant running entirely on this phone. Keep answers short."
+        UiState.SYSTEM_PROMPT,
+        SamplingOptions(temperature.value, topK.value, topP.value),
       )
     }
     val engine = llm ?: error("Text engine unavailable")
+    _state.update { it.copy(llmContextTokens = engine.contextTokens) }
 
-    val started = System.currentTimeMillis()
-    appendMessage(chat.id, ChatMessage(Speaker.MODEL, "", accelerator = engine.accelerator))
-    val builder = StringBuilder()
-    engine.send(prompt).collect { chunk ->
-      builder.append(chunk)
-      updateLastModelMessage(chat.id, builder.toString())
-    }
-    _state.update { s ->
-      s.copy(
-        chats = s.chats.map { c ->
-          if (c.id != chat.id || c.messages.isEmpty()) c
-          else c.copy(
-            messages = c.messages.dropLast(1) +
-              c.messages.last().copy(millis = System.currentTimeMillis() - started)
-          )
-        }
+    val sent = SystemClock.elapsedRealtime()
+    var firstToken = 0L
+    val raw = StringBuilder()
+    var stop = StopReason.COMPLETE
+    var detail: String? = null
+
+    appendMessage(
+      chat.id,
+      ChatMessage(
+        Speaker.MODEL, "",
+        accelerator = engine.accelerator,
+        timestamp = System.currentTimeMillis(),
+      ),
+    )
+
+    try {
+      engine.send(prompt).collect { chunk ->
+        if (chunk.isEmpty()) return@collect
+        // The first token is when prefill - and on an NPU any just-in-time compilation -
+        // has finished. It is usually most of a short reply's wall clock, so it is timed
+        // separately rather than folded into a tokens-per-second figure that would then
+        // describe neither phase.
+        if (firstToken == 0L) firstToken = SystemClock.elapsedRealtime()
+        raw.append(chunk)
+        val (thinking, answer) = splitThinking(raw.toString())
+        updateLastModelMessage(chat.id, answer, thinking)
+      }
+    } catch (e: CancellationException) {
+      stop = StopReason.CANCELLED
+      throw e
+    } catch (e: Throwable) {
+      stop = StopReason.ERROR
+      detail = e.message ?: e.javaClass.simpleName
+      Log.w(TAG, "generation failed", e)
+    } finally {
+      val done = SystemClock.elapsedRealtime()
+      val (thinking, answer) = splitThinking(raw.toString())
+      if (raw.isEmpty() && stop == StopReason.COMPLETE) {
+        stop = StopReason.EMPTY
+        detail = "The model produced no output. That usually means the context filled up - " +
+          "start a new chat, or raise the window in Settings."
+      }
+      finishLastModelMessage(
+        chat.id, answer, thinking,
+        ReplyStats(
+          ttftMillis = if (firstToken > 0) firstToken - sent else done - sent,
+          decodeMillis = if (firstToken > 0) done - firstToken else 0,
+          tokens = estimateTokens(answer) + estimateTokens(thinking.orEmpty()),
+          stop = stop,
+          detail = detail,
+        ),
+        done - sent,
       )
     }
   }
@@ -553,6 +673,45 @@ class AppViewModel(private val app: NeuroForgeApp) : ViewModel() {
     prefs().edit().putString(KEY_POLICY, next.name).apply()
   }
 
+  /**
+   * Changes the context window.
+   *
+   * Takes effect on the next model load, because `maxNumTokens` is an engine-construction
+   * parameter: the KV cache is allocated once, for that size. Reloading here would also
+   * discard the conversation the engine holds, which is a worse surprise than waiting.
+   */
+  fun setContextTokens(next: Int) {
+    val clamped = next.coerceIn(512, 32768)
+    contextTokens.value = clamped
+    prefs().edit().putInt(KEY_CONTEXT, clamped).apply()
+  }
+
+  fun setTemperature(next: Double) {
+    val clamped = next.coerceIn(0.0, 2.0)
+    temperature.value = clamped
+    prefs().edit().putFloat(KEY_TEMPERATURE, clamped.toFloat()).apply()
+  }
+
+  fun setTopK(next: Int) {
+    val clamped = next.coerceIn(1, 200)
+    topK.value = clamped
+    prefs().edit().putInt(KEY_TOP_K, clamped).apply()
+  }
+
+  fun setTopP(next: Double) {
+    val clamped = next.coerceIn(0.0, 1.0)
+    topP.value = clamped
+    prefs().edit().putFloat(KEY_TOP_P, clamped.toFloat()).apply()
+  }
+
+  /** Drops the loaded engine so the next message picks up changed settings. */
+  fun reloadEngine() {
+    llm?.close()
+    llm = null
+    loadedLlmModelId = null
+    _state.update { it.copy(llmContextTokens = 0) }
+  }
+
   fun setHfToken(next: String) {
     val cleaned = next.trim()
     hfToken.value = cleaned
@@ -589,27 +748,16 @@ class AppViewModel(private val app: NeuroForgeApp) : ViewModel() {
     AcceleratorPolicy.fromStoredName(prefs().getString(KEY_POLICY, null))
 
 
-  /** Writes the result as a lossless PNG; a 4K render is not something to re-encode as JPEG. */
-  fun saveResult(bitmap: Bitmap) {
-    // Encoding a 4096x4096 PNG takes seconds; doing it on the main thread would freeze the
-    // UI at exactly the moment the user is admiring the result.
-    viewModelScope.launch(Dispatchers.IO) {
-      try {
-        val dir = File(app.filesDir, "renders").apply { mkdirs() }
-        val out = File(dir, "neuroforge_${System.currentTimeMillis()}.png")
-        FileOutputStream(out).use { bitmap.compress(Bitmap.CompressFormat.PNG, 100, it) }
-        _state.update { it.copy(error = "Saved to ${out.name}") }
-      } catch (e: Throwable) {
-        _state.update { it.copy(error = "Save failed: ${e.message}") }
-      }
-    }
-  }
-
 
   companion object {
     private const val PREFS_NAME = "neuroforge"
     private const val KEY_POLICY = "accelerator_policy"
     private const val KEY_HF_TOKEN = "hugging_face_token"
+    private const val KEY_CONTEXT = "context_tokens"
+    private const val KEY_TEMPERATURE = "temperature"
+    private const val KEY_TOP_K = "top_k"
+    private const val KEY_TOP_P = "top_p"
+    private const val TAG = "AppViewModel"
 
     /** Job key for the whole-pipeline download; not a model id, so it cannot collide. */
     private const val IMAGE_PIPELINE_JOB = "pipeline:text-to-4k"

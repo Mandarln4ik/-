@@ -75,7 +75,7 @@ class TiledUpscaler(
         inBuf, pixelBuf, normalization,
       )
       session.writeInput(0, inBuf)
-      totalMillis += session.run().toDouble()
+      totalMillis += session.run()
       val out = session.readOutput(0)
 
       val outW = tile.srcW * grid.scale

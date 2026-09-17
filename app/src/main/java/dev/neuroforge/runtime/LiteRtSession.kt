@@ -132,11 +132,20 @@ class LiteRtSession private constructor(
     inputs[index].writeInt(data)
   }
 
-  /** Runs the graph. Returns the elapsed wall-clock in milliseconds. */
-  fun run(): Long {
+  /**
+   * Runs the graph. Returns the elapsed wall-clock in **milliseconds, fractional**.
+   *
+   * Fractional on purpose. This used to divide nanoseconds by a million into a `Long`, which
+   * quantised every measurement to a whole millisecond — and that is not a rounding nicety,
+   * it silently destroyed the one comparison this app exists to make. A graph taking 1.6 ms
+   * on the NPU and 2.4 ms on the CPU both reported "2 ms", and the speedup came out as
+   * exactly 1.00x, which reads as "the NPU does nothing" rather than as "the clock cannot
+   * see the difference".
+   */
+  fun run(): Double {
     val t0 = SystemClock.elapsedRealtimeNanos()
     model.run(inputs, outputs)
-    return (SystemClock.elapsedRealtimeNanos() - t0) / 1_000_000
+    return (SystemClock.elapsedRealtimeNanos() - t0) / 1_000_000.0
   }
 
   /** Reads output tensor [index] as floats. */

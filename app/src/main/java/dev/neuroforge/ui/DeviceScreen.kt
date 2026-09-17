@@ -146,11 +146,12 @@ fun DeviceScreen(vm: AppViewModel, state: UiState) {
               fontFamily = FontFamily.Monospace,
               modifier = Modifier.padding(top = 14.dp),
             )
-            report.npuSpeedupOverCpu()?.let { speedup ->
+            // The ratio alone is not a finding: a value near 1.00 can mean the clock could
+            // not resolve the difference, that the two overlap inside their own spread, or
+            // that the APU genuinely does not help here. Only the last is worth acting on.
+            report.interpretation()?.let { verdict ->
               Text(
-                if (speedup >= 1.0) "The NPU is %.1fx faster than the CPU here.".format(speedup)
-                else "The NPU is slower than the CPU on this graph (%.2fx) — for this stage, " +
-                  "CPU is the right target.".format(speedup),
+                verdict,
                 style = MaterialTheme.typography.bodySmall,
                 modifier = Modifier.padding(top = 8.dp),
               )
