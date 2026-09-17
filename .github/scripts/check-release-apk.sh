@@ -29,11 +29,21 @@ test -n "$(find "${work}/lib" -name 'libllama_jni.so' 2>/dev/null)" || {
 }
 echo "ok: libllama_jni.so is packaged"
 
-symbols="$("${dexdump}" -d "${work}"/classes*.dex 2>/dev/null || true)"
+# Dumped to a file rather than held in a shell variable and piped.
+#
+# The first version of this did `printf '%s' "$symbols" | grep -q`, which is wrong in a way
+# that reports the opposite of the truth: `grep -q` exits at the first match, printf takes
+# SIGPIPE, and under `set -o pipefail` the pipeline's status becomes that failure. So a
+# symbol that IS present made the check fail, and the "Broken pipe" warning in the log was
+# the tell. A file has no pipe to break, and a multi-megabyte dex does not belong in a
+# shell variable anyway.
+symbols="${work}/symbols.txt"
+"${dexdump}" -d "${work}"/classes*.dex > "${symbols}" 2>/dev/null || true
+test -s "${symbols}" || { echo "dexdump produced nothing to check"; exit 1; }
 
 fail=0
 check() {
-  if printf '%s' "${symbols}" | grep -q -- "$1"; then
+  if grep -q -F -- "$1" "${symbols}"; then
     echo "ok: $2"
   else
     echo "FAIL: $2 — R8 renamed or removed it; see app/proguard-rules.pro"
