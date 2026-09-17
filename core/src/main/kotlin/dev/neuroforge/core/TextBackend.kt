@@ -66,6 +66,20 @@ enum class TextBackend(
   /** True when this runtime can put a generative model on the NPU. */
   val reachesNpu: Boolean get() = Accel.NPU in accelerators
 
+  /**
+   * True when this runtime can call a tool the app defines.
+   *
+   * LiteRT-LM takes an OpenAPI description and, with automatic tool calling on, invokes
+   * the function itself and folds the result back into the turn. ExecuTorch's published
+   * runtime has no equivalent, and llama.cpp's grammar-constrained calling is not exposed
+   * through the C API this app builds against.
+   *
+   * A property of the runtime only. Whether a given *model* ever emits a tool call is a
+   * separate question the app cannot answer in advance: one not trained for it simply
+   * never asks, and the descriptions cost it a little context for nothing.
+   */
+  val supportsTools: Boolean get() = this == LITERT_LM
+
   /** One line for the settings list, stating the trade rather than selling the option. */
   val summary: String
     get() = when (this) {

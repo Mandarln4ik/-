@@ -62,6 +62,16 @@ class TextBackendTest {
   }
 
   @Test
+  fun `only litert can call tools`() {
+    // Same shape as the NPU claim, and for the same reason: a property of the shipped
+    // runtime rather than a ranking. Offering a tool to a backend that cannot invoke one
+    // would put its description in the model's context and then never fire.
+    assertTrue(TextBackend.LITERT_LM.supportsTools)
+    assertTrue(!TextBackend.EXECUTORCH.supportsTools)
+    assertTrue(!TextBackend.LLAMA_CPP.supportsTools)
+  }
+
+  @Test
   fun `every backend says what it trades away`() {
     TextBackend.entries.forEach { backend ->
       assertTrue(backend.summary.isNotBlank(), "${backend.name} has no summary")

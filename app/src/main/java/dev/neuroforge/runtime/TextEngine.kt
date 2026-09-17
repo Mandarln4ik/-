@@ -78,7 +78,7 @@ interface TextEngine : AutoCloseable {
    * not something the app can know in advance: one that was not trained for it simply
    * never calls anything, which costs only the descriptions' place in its context.
    */
-  val supportsTools: Boolean get() = false
+  val supportsTools: Boolean get() = backend.supportsTools
 
   /**
    * Starts a fresh conversation, discarding any previous one.

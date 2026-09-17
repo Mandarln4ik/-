@@ -55,8 +55,6 @@ class LiteRtLmEngine private constructor(
    * The engine holds conversation state, so this is what "new chat" actually means; the
    * message list in the UI is a record of it, not the state itself.
    */
-  override val supportsTools: Boolean get() = true
-
   override suspend fun startConversation(
     systemPrompt: String,
     sampling: SamplingOptions,
