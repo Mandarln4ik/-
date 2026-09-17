@@ -23,6 +23,7 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import dev.neuroforge.core.Accel
 import dev.neuroforge.core.AcceleratorPolicy
 import dev.neuroforge.core.ModelCatalog
+import dev.neuroforge.core.TextBackend
 
 /**
  * Where the accelerator choice lives.
@@ -36,6 +37,7 @@ import dev.neuroforge.core.ModelCatalog
 fun SettingsScreen(vm: AppViewModel, state: UiState) {
   val policy by vm.policy.collectAsStateWithLifecycle()
   val token by vm.hfToken.collectAsStateWithLifecycle()
+  val backend by vm.textBackend.collectAsStateWithLifecycle()
   val contextTokens by vm.contextTokens.collectAsStateWithLifecycle()
   val temperature by vm.temperature.collectAsStateWithLifecycle()
   val topK by vm.topK.collectAsStateWithLifecycle()
@@ -65,6 +67,55 @@ fun SettingsScreen(vm: AppViewModel, state: UiState) {
             }
           }
         }
+      }
+    }
+
+    item {
+      SectionCard("Text backend") {
+        Text(
+          "Three runtimes, and the difference that matters is not speed — it is which " +
+            "model files each one reads and which silicon each one can reach. This chooses " +
+            "what the new-chat list offers; a model is always opened by the runtime that " +
+            "reads its format.",
+          style = MaterialTheme.typography.bodySmall,
+          color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        TextBackend.entries.forEach { option ->
+          Row(
+            Modifier.fillMaxWidth().padding(top = 10.dp),
+            verticalAlignment = Alignment.Top,
+          ) {
+            RadioButton(
+              selected = backend == option,
+              onClick = { vm.setTextBackend(option) },
+            )
+            Column(Modifier.padding(start = 8.dp)) {
+              Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(option.label, style = MaterialTheme.typography.bodyMedium)
+                Text(
+                  if (option.reachesNpu) "  · NPU" else "  · CPU",
+                  style = MaterialTheme.typography.labelSmall,
+                  color = if (option.reachesNpu) MaterialTheme.colorScheme.secondary
+                  else MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+              }
+              Text(
+                option.summary,
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+              )
+            }
+          }
+        }
+        Text(
+          "Only LiteRT-LM reaches the APU, and that is a fact about the shipped binaries " +
+            "rather than a ranking. ExecuTorch has a MediaTek backend, but it is compiled " +
+            "in when the runtime is built and the public one carries XNNPACK alone. " +
+            "llama.cpp has no MediaTek path at all.",
+          style = MaterialTheme.typography.labelSmall,
+          color = MaterialTheme.colorScheme.onSurfaceVariant,
+          modifier = Modifier.padding(top = 12.dp),
+        )
       }
     }
 

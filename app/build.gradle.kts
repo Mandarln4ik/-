@@ -83,6 +83,9 @@ dependencies {
   // Text generation runs on a different runtime: it owns the KV cache and the decode
   // loop, and is the only one here with an NPU backend for a generative model.
   implementation(libs.litertlm)
+  // A second text runtime, for the models that are published as .pte rather than
+  // .litertlm. CPU only; see TextBackend for why that is the artifact and not the choice.
+  implementation(libs.executorch)
 
   implementation(libs.androidx.core.ktx)
   implementation(libs.androidx.activity.compose)

@@ -21,6 +21,8 @@ import dev.neuroforge.core.BenchmarkReport
 import dev.neuroforge.core.ContextBudget
 import dev.neuroforge.core.ReplyStats
 import dev.neuroforge.core.StopReason
+import dev.neuroforge.core.TextBackend
+import dev.neuroforge.core.backendFor
 import dev.neuroforge.core.contextUsed
 import dev.neuroforge.core.estimateTokens
 import dev.neuroforge.core.mostRecentFirst
@@ -38,7 +40,8 @@ import dev.neuroforge.models.ChatStore
 import dev.neuroforge.models.HfBrowser
 import dev.neuroforge.models.ModelState
 import dev.neuroforge.models.RepoFile
-import dev.neuroforge.runtime.LlmEngine
+import dev.neuroforge.runtime.TextEngine
+import dev.neuroforge.runtime.TextEngines
 import dev.neuroforge.runtime.LlmLoadProgress
 import dev.neuroforge.runtime.SamplingOptions
 import dev.neuroforge.pipeline.GenerationProgress
@@ -135,6 +138,15 @@ class AppViewModel(private val app: NeuroForgeApp) : ViewModel() {
    * to survive the app being killed mid-download.
    */
   val policy = MutableStateFlow(loadPolicy())
+
+  /**
+   * Which text runtime to prefer.
+   *
+   * This filters what the model list offers. It does not decide what opens a given file —
+   * that follows the extension, because a `.gguf` cannot be read by LiteRT-LM whatever is
+   * selected here.
+   */
+  val textBackend = MutableStateFlow(TextBackend.fromStoredName(prefs().getString(KEY_BACKEND, null)))
 
   // ---- Inference settings -------------------------------------------------------------
   // These four are what LiteRT-LM actually exposes: `maxNumTokens` on the engine and the
@@ -345,7 +357,7 @@ class AppViewModel(private val app: NeuroForgeApp) : ViewModel() {
 
   // ---- chats ------------------------------------------------------------------------
 
-  private var llm: LlmEngine? = null
+  private var llm: TextEngine? = null
   private var loadedLlmModelId: String? = null
   private var replyJob: Job? = null
 
@@ -361,8 +373,21 @@ class AppViewModel(private val app: NeuroForgeApp) : ViewModel() {
   }
 
   /** Models that can drive a chat of this kind and are already downloaded. */
+  /**
+   * Downloaded models that can drive a chat of this kind.
+   *
+   * Text chats are additionally filtered to the preferred runtime, so the list offers what
+   * the chosen backend reads. A model whose format belongs to a different backend is not
+   * hidden from the Models tab - it is only left out of the "new chat" list, where picking
+   * it would fail at load rather than at the click.
+   */
   fun availableModels(kind: ChatKind): List<ModelSpec> =
-    modelsFor(kind).filter { app.repository.isReady(it) }
+    modelsFor(kind)
+      .filter { app.repository.isReady(it) }
+      .filter { spec ->
+        kind != ChatKind.TEXT ||
+          spec.files.any { backendFor(it.fileName) == textBackend.value }
+      }
 
   fun createChat(kind: ChatKind, modelId: String) {
     val chat = Chat(
@@ -486,11 +511,17 @@ class AppViewModel(private val app: NeuroForgeApp) : ViewModel() {
       llm = null
       loadedLlmModelId = null
       try {
-        llm = LlmEngine.load(
+        llm = TextEngines.load(
           context = app,
           modelFile = file,
           policy = policy.value,
           contextTokens = contextTokens.value,
+          sampling = SamplingOptions(temperature.value, topK.value, topP.value),
+          // ExecuTorch keeps the tokenizer outside the model, so it is a second file in
+          // the same spec; the other backends carry theirs inside and ignore this.
+          tokenizerFile = spec.files
+            .firstOrNull { it.fileName.endsWith(".json") || it.fileName.endsWith(".model") }
+            ?.let { app.repository.fileFor(spec, it) },
         ) { progress -> _state.update { it.copy(llmLoad = progress) } }
       } finally {
         _state.update { it.copy(llmLoad = null) }
@@ -694,6 +725,12 @@ class AppViewModel(private val app: NeuroForgeApp) : ViewModel() {
     prefs().edit().putFloat(KEY_TOP_P, clamped.toFloat()).apply()
   }
 
+  fun setTextBackend(next: TextBackend) {
+    textBackend.value = next
+    prefs().edit().putString(KEY_BACKEND, next.name).apply()
+    reloadEngine()
+  }
+
   /** Drops the loaded engine so the next message picks up changed settings. */
   fun reloadEngine() {
     llm?.close()
@@ -744,6 +781,7 @@ class AppViewModel(private val app: NeuroForgeApp) : ViewModel() {
     private const val KEY_POLICY = "accelerator_policy"
     private const val KEY_HF_TOKEN = "hugging_face_token"
     private const val KEY_CONTEXT = "context_tokens"
+    private const val KEY_BACKEND = "text_backend"
     private const val KEY_TEMPERATURE = "temperature"
     private const val KEY_TOP_K = "top_k"
     private const val KEY_TOP_P = "top_p"

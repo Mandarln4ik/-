@@ -14,26 +14,13 @@ import com.google.ai.edge.litertlm.Message
 import com.google.ai.edge.litertlm.SamplerConfig
 import dev.neuroforge.core.Accel
 import dev.neuroforge.core.AcceleratorPolicy
+import dev.neuroforge.core.TextBackend
 import dev.neuroforge.core.explainLlmFailure
 import java.io.File
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.withContext
-
-/** Where a model load has got to. There is no percentage to report; see [LlmEngine.load]. */
-data class LlmLoadProgress(
-  val stage: String,
-  val elapsedMillis: Long,
-  val tried: List<String> = emptyList(),
-)
-
-/** How a chat is sampled. Mirrors LiteRT-LM's `SamplerConfig`. */
-data class SamplingOptions(
-  val temperature: Double = 0.7,
-  val topK: Int = 40,
-  val topP: Double = 0.9,
-)
 
 /**
  * A loaded text model and one conversation on it.
@@ -48,13 +35,15 @@ data class SamplingOptions(
  * @param contextTokens the window the engine was configured with, for the context gauge.
  * @param loadMillis how long [load] took, including any just-in-time NPU compilation.
  */
-class LlmEngine private constructor(
-  val accelerator: Accel,
-  val contextTokens: Int,
-  val loadMillis: Long,
-  val attempts: List<String>,
+class LiteRtLmEngine private constructor(
+  override val accelerator: Accel,
+  override val contextTokens: Int,
+  override val loadMillis: Long,
+  override val attempts: List<String>,
   private val engine: Engine,
-) : AutoCloseable {
+) : TextEngine {
+
+  override val backend: TextBackend get() = TextBackend.LITERT_LM
 
   private var conversation: Conversation? = null
 
@@ -64,9 +53,9 @@ class LlmEngine private constructor(
    * The engine holds conversation state, so this is what "new chat" actually means; the
    * message list in the UI is a record of it, not the state itself.
    */
-  suspend fun startConversation(
+  override suspend fun startConversation(
     systemPrompt: String,
-    sampling: SamplingOptions = SamplingOptions(),
+    sampling: SamplingOptions,
   ): Unit = withContext(Dispatchers.IO) {
     closeConversation()
     conversation = engine.createConversation(
@@ -89,7 +78,7 @@ class LlmEngine private constructor(
    * subtly worse rendering — it puts the data class's own debug representation into the
    * conversation instead of the model's words.
    */
-  fun send(prompt: String): Flow<String> {
+  override fun send(prompt: String): Flow<String> {
     val conv = conversation ?: error("No conversation started")
     return conv.sendMessageAsync(prompt).map { it.text() }
   }
@@ -113,7 +102,7 @@ class LlmEngine private constructor(
   }
 
   companion object {
-    private const val TAG = "LlmEngine"
+    private const val TAG = "LiteRtLmEngine"
 
     /**
      * Loads [modelFile], trying the backends [policy] allows in order.
@@ -134,7 +123,7 @@ class LlmEngine private constructor(
       policy: AcceleratorPolicy = AcceleratorPolicy.AUTO,
       contextTokens: Int = 2048,
       onProgress: (LlmLoadProgress) -> Unit = {},
-    ): LlmEngine = withContext(Dispatchers.IO) {
+    ): LiteRtLmEngine = withContext(Dispatchers.IO) {
       require(modelFile.isFile) { "model file missing: ${modelFile.absolutePath}" }
       val started = SystemClock.elapsedRealtime()
       fun elapsed() = SystemClock.elapsedRealtime() - started
@@ -169,7 +158,7 @@ class LlmEngine private constructor(
           onSuccess = {
             Log.i(TAG, "${modelFile.name} -> $accel in ${elapsed()} ms")
             onProgress(LlmLoadProgress("Ready on $accel", elapsed(), failures.toList()))
-            return@withContext LlmEngine(
+            return@withContext LiteRtLmEngine(
               accel, contextTokens, elapsed(), failures.toList(), it,
             )
           },

@@ -523,11 +523,52 @@ object ModelCatalog {
       "is tight or you would rather not sign anything.",
   )
 
+  /**
+   * Qwen 2.5 0.5B as an ExecuTorch `.pte`.
+   *
+   * Here because ExecuTorch is only worth offering if something can be loaded into it, and
+   * `executorch-community` is where PyTorch exports land. Two files: the graph and its
+   * tokenizer, because a `.pte` is the graph alone and ExecuTorch takes the tokenizer as a
+   * separate path.
+   *
+   * CPU, and marked as such. The public ExecuTorch runtime carries XNNPACK and no vendor
+   * backend, so claiming an NPU target here would be the claim this app exists to avoid.
+   */
+  val LLM_QWEN25_05B_PTE = ModelSpec(
+    id = "llm.qwen25_0_5b_executorch",
+    displayName = "Qwen2.5 0.5B Instruct (ExecuTorch)",
+    role = ModelRole.TEXT_CHAT,
+    accelerators = listOf(Accel.CPU),
+    files = listOf(
+      ModelFile(
+        fileName = "qwen2_5_0_5b.pte",
+        source = ModelSource.HuggingFace(
+          repoId = "executorch-community/Qwen2.5-0.5B-Instruct-ExecuTorch",
+          path = "qwen2_5-0_5b-instruct.pte",
+          hints = listOf("xnnpack", "q8", "int8"),
+        ),
+        sizeBytes = 0L,
+      ),
+      ModelFile(
+        fileName = "tokenizer.json",
+        source = ModelSource.HuggingFace(
+          repoId = "executorch-community/Qwen2.5-0.5B-Instruct-ExecuTorch",
+          path = "tokenizer.json",
+          requires = listOf("tokenizer"),
+        ),
+        sizeBytes = 0L,
+      ),
+    ),
+    notes = "Runs on ExecuTorch, which is CPU-only as published. Pick it to compare a " +
+      "PyTorch export against the LiteRT path, not to go faster.",
+  )
+
   /** Everything, for the model-manager screen. */
   val all: List<ModelSpec> = listOf(
     BENCHMARK_MOBILENET,
     LLM_GEMMA3_1B,
     LLM_QWEN3_06B,
+    LLM_QWEN25_05B_PTE,
     UPSCALER_ESRGAN_X4,
     BONSAI_TEXT_ENCODER,
     BONSAI_DIT,

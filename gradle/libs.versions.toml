@@ -20,6 +20,9 @@ androidxJunit = "1.1.5"
 espresso = "3.5.1"
 
 [libraries]
+# PyTorch ExecuTorch. CPU only as published: the AAR carries XNNPACK and no vendor
+# backend, which is why the backend picker says so rather than offering an NPU option.
+executorch = { module = "org.pytorch:executorch-android", version = "1.4.0" }
 androidx-core-ktx = { group = "androidx.core", name = "core-ktx", version.ref = "coreKtx" }
 androidx-activity-compose = { group = "androidx.activity", name = "activity-compose", version.ref = "activityCompose" }
 androidx-lifecycle-runtime-ktx = { group = "androidx.lifecycle", name = "lifecycle-runtime-ktx", version.ref = "lifecycle" }
