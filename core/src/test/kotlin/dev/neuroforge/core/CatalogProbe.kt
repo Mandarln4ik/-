@@ -49,6 +49,7 @@ fun main() {
           println("   FAIL      ${file.fileName}: ${outcome.reason}")
           outcome.listing.take(60).forEach { println("               $it") }
           if (outcome.listing.size > 60) println("               … ${outcome.listing.size - 60} more")
+          outcome.nearby.forEach { println("               did you mean: $it") }
         }
       }
       // What else the repository offers for this entry. Printed because a repository that
@@ -77,7 +78,13 @@ private sealed interface Outcome {
   data class Declared(val bytes: Long) : Outcome
   data class Resolved(val actual: String, val bytes: Long) : Outcome
   data class Gated(val code: Int) : Outcome
-  data class Failed(val reason: String, val listing: List<String>) : Outcome
+
+  /** @param nearby repositories that exist, when the declared one does not. */
+  data class Failed(
+    val reason: String,
+    val listing: List<String>,
+    val nearby: List<String> = emptyList(),
+  ) : Outcome
 }
 
 private fun probe(file: ModelFile): Outcome {
@@ -93,6 +100,12 @@ private fun probe(file: ModelFile): Outcome {
     return Outcome.Failed(
       "HTTP ${first.code} at the declared path and ${source.repoId} could not be listed",
       emptyList(),
+      // Hugging Face answers 401 for a repository that is private *and* for one that does
+      // not exist, so a failure here does not say which. The suggestions do: if the search
+      // returns neighbours and not the repository itself, the name in the catalogue was
+      // wrong. Worth automating because the authoring environment cannot reach Hugging
+      // Face, so the alternative is another guess and another round trip.
+      nearby = suggestRepos(source.repoId),
     )
   }
   val chosen =
@@ -155,6 +168,28 @@ private fun listRepo(repoId: String): List<String> = listings.getOrPut(repoId) {
     Regex("\"path\"\\s*:\\s*\"([^\"]+)\"").findAll(body).map { it.groupValues[1] }.toList()
   }.getOrDefault(emptyList())
 }
+
+/**
+ * Repositories that do exist, for a declared one that could not be read.
+ *
+ * Two searches: the owner's own catalogue narrowed to the most distinctive word in the
+ * name, then the whole hub by the full name — because the owner can be the wrong part.
+ */
+private fun suggestRepos(repoId: String): List<String> {
+  val owner = repoId.substringBefore('/')
+  val name = repoId.substringAfter('/')
+  val distinctive = name.split('-', '_', '.').maxByOrNull { it.length } ?: name
+  return (searchModels("author=$owner&search=$distinctive") + searchModels("search=$name"))
+    .distinct()
+    .take(12)
+}
+
+private fun searchModels(query: String): List<String> = runCatching {
+  val body = URL("$HF/api/models?$query&limit=20").readText()
+  // As with listRepo: a regex rather than a JSON dependency, for a diagnostic. `"_id"`
+  // does not match, since the pattern needs the quote immediately before `id`.
+  Regex("\"id\"\\s*:\\s*\"([^\"]+)\"").findAll(body).map { it.groupValues[1] }.toList()
+}.getOrDefault(emptyList())
 
 private fun size(bytes: Long): String = if (bytes > 0) "${formatBytes(bytes)} ($bytes)" else ""
 

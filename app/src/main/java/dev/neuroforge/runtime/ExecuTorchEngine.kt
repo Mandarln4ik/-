@@ -75,7 +75,10 @@ class ExecuTorchEngine private constructor(
     // it, and repeating it would spend context on a duplicate every turn.
     systemPrompt = ""
 
-    val config = LlmGenerationConfig.Builder()
+    // `LlmGenerationConfig.Builder()` is not callable from Kotlin: these are Kotlin
+    // classes and the builder constructors are `internal`, which the compiler enforces
+    // across modules even though the bytecode says public. `create()` is the way in.
+    val config = LlmGenerationConfig.create()
       .seqLen(contextTokens)
       .temperature(sampling.temperature.toFloat())
       // The prompt is already in the chat above the reply; echoing it back would print it
@@ -146,7 +149,7 @@ class ExecuTorchEngine private constructor(
       onProgress(LlmLoadProgress("Loading on CPU (ExecuTorch)", 0))
 
       val module = LlmModule(
-        LlmModuleConfig.Builder()
+        LlmModuleConfig.create()
           .modulePath(modelFile.absolutePath)
           .tokenizerPath(tokenizer.absolutePath)
           .temperature(sampling.temperature.toFloat())
