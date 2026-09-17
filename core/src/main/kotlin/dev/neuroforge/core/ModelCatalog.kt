@@ -524,36 +524,43 @@ object ModelCatalog {
   )
 
   /**
-   * Qwen 2.5 0.5B as an ExecuTorch `.pte`.
+   * Llama 3.2 1B as an ExecuTorch `.pte`.
    *
-   * Here because ExecuTorch is only worth offering if something can be loaded into it, and
-   * `executorch-community` is where PyTorch exports land. Two files: the graph and its
-   * tokenizer, because a `.pte` is the graph alone and ExecuTorch takes the tokenizer as a
+   * ExecuTorch is only worth offering if something can be loaded into it, and
+   * `executorch-community` is where PyTorch's own exports land. This repository name came
+   * out of the hub's own search rather than a guess: the first attempt here pointed at a
+   * repository that answered 401, which is Hugging Face's reply for "private" and for
+   * "does not exist" alike, and the probe now prints what does exist instead.
+   *
+   * SpinQuant is a 4-bit post-training quantisation, so this is about the size of the int4
+   * LiteRT bundles and runs on the same phone.
+   *
+   * Two files, because a `.pte` is the graph alone and ExecuTorch takes the tokenizer as a
    * separate path.
    *
    * CPU, and marked as such. The public ExecuTorch runtime carries XNNPACK and no vendor
    * backend, so claiming an NPU target here would be the claim this app exists to avoid.
    */
-  val LLM_QWEN25_05B_PTE = ModelSpec(
-    id = "llm.qwen25_0_5b_executorch",
-    displayName = "Qwen2.5 0.5B Instruct (ExecuTorch)",
+  val LLM_LLAMA32_1B_PTE = ModelSpec(
+    id = "llm.llama32_1b_executorch",
+    displayName = "Llama 3.2 1B Instruct (ExecuTorch)",
     role = ModelRole.TEXT_CHAT,
     accelerators = listOf(Accel.CPU),
     files = listOf(
       ModelFile(
-        fileName = "qwen2_5_0_5b.pte",
+        fileName = "llama32_1b_spinquant.pte",
         source = ModelSource.HuggingFace(
-          repoId = "executorch-community/Qwen2.5-0.5B-Instruct-ExecuTorch",
-          path = "qwen2_5-0_5b-instruct.pte",
-          hints = listOf("xnnpack", "q8", "int8"),
+          repoId = "executorch-community/Llama-3.2-1B-Instruct-SpinQuant_INT4_EO8-ET",
+          path = "llama3_2-1B-Instruct-SpinQuant_INT4_EO8.pte",
+          hints = listOf("spinquant", "int4", "1b"),
         ),
         sizeBytes = 0L,
       ),
       ModelFile(
-        fileName = "tokenizer.json",
+        fileName = "tokenizer.model",
         source = ModelSource.HuggingFace(
-          repoId = "executorch-community/Qwen2.5-0.5B-Instruct-ExecuTorch",
-          path = "tokenizer.json",
+          repoId = "executorch-community/Llama-3.2-1B-Instruct-SpinQuant_INT4_EO8-ET",
+          path = "tokenizer.model",
           requires = listOf("tokenizer"),
         ),
         sizeBytes = 0L,
@@ -561,6 +568,43 @@ object ModelCatalog {
     ),
     notes = "Runs on ExecuTorch, which is CPU-only as published. Pick it to compare a " +
       "PyTorch export against the LiteRT path, not to go faster.",
+  )
+
+  /**
+   * SmolLM2 135M as an ExecuTorch `.pte`.
+   *
+   * The smallest thing in the catalogue by an order of magnitude, and here as a "does this
+   * backend work at all" model rather than as a useful assistant — at 135M parameters the
+   * answers show it. Worth the entry because it downloads in seconds, so a backend that
+   * cannot open a file says so immediately instead of after a gigabyte.
+   */
+  val LLM_SMOLLM2_135M_PTE = ModelSpec(
+    id = "llm.smollm2_135m_executorch",
+    displayName = "SmolLM2 135M (ExecuTorch)",
+    role = ModelRole.TEXT_CHAT,
+    accelerators = listOf(Accel.CPU),
+    files = listOf(
+      ModelFile(
+        fileName = "smollm2_135m.pte",
+        source = ModelSource.HuggingFace(
+          repoId = "executorch-community/SmolLM2-135M",
+          path = "smollm2_135m.pte",
+          hints = listOf("xnnpack", "8da4w", "q8"),
+        ),
+        sizeBytes = 0L,
+      ),
+      ModelFile(
+        fileName = "tokenizer.json",
+        source = ModelSource.HuggingFace(
+          repoId = "executorch-community/SmolLM2-135M",
+          path = "tokenizer.json",
+          requires = listOf("tokenizer"),
+        ),
+        sizeBytes = 0L,
+      ),
+    ),
+    notes = "135M parameters — small enough to prove the ExecuTorch path works in under a " +
+      "minute, and far too small to be useful for anything else.",
   )
 
 
@@ -602,11 +646,9 @@ object ModelCatalog {
   /**
    * Qwen 2.5 0.5B as GGUF, from Qwen's own repository.
    *
-   * The smallest thing here that still holds a conversation, and the counterpart to
-   * [LLM_QWEN25_05B_PTE] in the same way the Gemma pair works — same weights, different
-   * runtime. It is also a ChatML model, where Gemma is not, so between the two of them
-   * llama.cpp's chat templating is exercised on both of the families it is most likely to
-   * meet.
+   * The smallest thing here that still holds a conversation. It is a ChatML model where
+   * [LLM_GEMMA3_1B_GGUF] is not, so between the two of them llama.cpp's chat templating is
+   * exercised on both of the families it is most likely to meet.
    */
   val LLM_QWEN25_05B_GGUF = ModelSpec(
     id = "llm.qwen25_0_5b_gguf",
@@ -633,7 +675,8 @@ object ModelCatalog {
     BENCHMARK_MOBILENET,
     LLM_GEMMA3_1B,
     LLM_QWEN3_06B,
-    LLM_QWEN25_05B_PTE,
+    LLM_LLAMA32_1B_PTE,
+    LLM_SMOLLM2_135M_PTE,
     LLM_GEMMA3_1B_GGUF,
     LLM_QWEN25_05B_GGUF,
     UPSCALER_ESRGAN_X4,

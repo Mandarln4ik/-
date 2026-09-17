@@ -65,6 +65,28 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(llama)
 
+# Check the instruction-set flag actually reached the compiler.
+#
+# Worth asserting because the failure is silent and expensive. ggml prints a
+# "Failed to get ARM features" warning during an NDK build -- its diagnostic probe invokes
+# the compiler without the --target= that the toolchain file passes in the flags, so a bare
+# clang sees an ARM -march and reports it as an unknown x86 CPU. That is cosmetic, and it
+# looks exactly like the flag having been rejected. If the flag really were dropped -- a
+# typo, or an upstream rename of this variable -- the quantised kernels would fall back to
+# the armv8-a baseline and the only symptom would be decoding several times slower than it
+# should. So read it back off the target instead of reading the log.
+if (ANDROID AND TARGET ggml-cpu)
+    get_target_property(ggml_cpu_options ggml-cpu COMPILE_OPTIONS)
+    string(FIND "${ggml_cpu_options}" "-march=${GGML_CPU_ARM_ARCH}" march_position)
+    if (march_position EQUAL -1)
+        message(FATAL_ERROR
+            "ggml-cpu is not being compiled with -march=${GGML_CPU_ARM_ARCH}. Its options "
+            "are: ${ggml_cpu_options}. Without it the int8 kernels compile to the armv8-a "
+            "baseline and decoding is several times slower.")
+    endif()
+    message(STATUS "llama_jni: ggml-cpu compiles with -march=${GGML_CPU_ARM_ARCH}")
+endif()
+
 add_library(llama_jni SHARED llama_jni.cpp)
 target_compile_features(llama_jni PRIVATE cxx_std_17)
 

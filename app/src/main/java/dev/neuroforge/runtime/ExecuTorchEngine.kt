@@ -97,8 +97,8 @@ class ExecuTorchEngine private constructor(
         Log.i(TAG, "stats: $stats")
       }
 
-      override fun onError(code: Int, message: String) {
-        close(IllegalStateException("ExecuTorch error $code: $message"))
+      override fun onError(errorCode: Int, message: String) {
+        close(IllegalStateException("ExecuTorch error $errorCode: $message"))
       }
     }
 

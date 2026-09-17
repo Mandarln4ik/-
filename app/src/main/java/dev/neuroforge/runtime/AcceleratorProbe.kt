@@ -79,8 +79,10 @@ object AcceleratorProbe {
   )
 
   fun probe(context: Context): DeviceReport {
-    val socManufacturer = Build.SOC_MANUFACTURER ?: "unknown"
-    val socModel = Build.SOC_MODEL ?: "unknown"
+    // Both are non-null on API 31+ and already read "unknown" when the platform has no
+    // answer, so there is nothing to fall back to — an elvis here was dead code.
+    val socManufacturer = Build.SOC_MANUFACTURER
+    val socModel = Build.SOC_MODEL
     val boardPlatform = systemProperty("ro.board.platform") ?: "unknown"
 
     val vendor = classifyVendor(socManufacturer, socModel, boardPlatform)
