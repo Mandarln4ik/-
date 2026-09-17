@@ -378,16 +378,6 @@ class AppViewModel(private val app: NeuroForgeApp) : ViewModel() {
 
   fun openChat(id: String?) = _state.update { it.copy(activeChatId = id) }
 
-  fun deleteChat(id: String) {
-    _state.update { s ->
-      s.copy(
-        chats = s.chats.filterNot { it.id == id },
-        activeChatId = if (s.activeChatId == id) null else s.activeChatId,
-      )
-    }
-    persistChats()
-  }
-
   private fun appendMessage(chatId: String, message: ChatMessage) {
     _state.update { s ->
       s.copy(
@@ -594,7 +584,7 @@ class AppViewModel(private val app: NeuroForgeApp) : ViewModel() {
         timestamp = System.currentTimeMillis(),
       ),
     )
-    _state.update { it.copy(generation = null, result = result) }
+    _state.update { it.copy(generation = null) }
   }
 
   fun cancelReply() {

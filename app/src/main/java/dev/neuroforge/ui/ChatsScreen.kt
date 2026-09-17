@@ -297,7 +297,7 @@ private fun ImageSettings(vm: AppViewModel) {
   SectionCard("Generation") {
     Text("Output", style = MaterialTheme.typography.labelSmall)
     Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-      OutputTarget.entries.take(3).forEach { preset ->
+      OutputTarget.presets.take(3).forEach { preset ->
         FilterChip(
           selected = target == preset,
           onClick = { vm.setTarget(preset) },
