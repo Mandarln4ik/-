@@ -14,8 +14,8 @@ android {
     // 31 is where Build.SOC_MODEL arrives, and it is the floor the LiteRT NPU samples use.
     minSdk = 31
     targetSdk = 36
-    versionCode = 4
-    versionName = "1.1.2"
+    versionCode = 5
+    versionName = "1.2.0"
 
     // The NPU accelerators ship arm64 only; shipping other ABIs would only grow the APK
     // with builds that can never reach the hardware this app exists for.
@@ -80,6 +80,9 @@ dependencies {
   implementation("dev.neuroforge:core:1.0")
 
   implementation(libs.litert)
+  // Text generation runs on a different runtime: it owns the KV cache and the decode
+  // loop, and is the only one here with an NPU backend for a generative model.
+  implementation(libs.litertlm)
 
   implementation(libs.androidx.core.ktx)
   implementation(libs.androidx.activity.compose)

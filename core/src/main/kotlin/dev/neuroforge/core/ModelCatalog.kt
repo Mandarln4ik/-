@@ -1,7 +1,7 @@
 package dev.neuroforge.core
 
 /** What a graph does inside the pipeline. */
-enum class ModelRole { TEXT_ENCODER, DENOISER, VAE_DECODER, UPSCALER, BENCHMARK }
+enum class ModelRole { TEXT_ENCODER, TEXT_CHAT, DENOISER, VAE_DECODER, UPSCALER, AUDIO, BENCHMARK }
 
 /** An inference target. */
 enum class Accel { NPU, GPU, CPU }
@@ -89,14 +89,34 @@ sealed interface ModelSource {
    *   warning, and a name that is merely plausible produces a 404 at the worst moment — on
    *   someone's phone, at the point they press Download. So [hints] exists: when [path] is
    *   not there, the repository is listed and the file is picked by these instead.
-   * @param hints lowercase substrings that identify the right file among the repo's other
-   *   `.tflite` files, most significant first.
+   * @param hints lowercase substrings that *rank* the candidates — typically the
+   *   quantisation recipe. A file matching none of them is still a candidate.
+   * @param requires lowercase substrings a candidate *must* contain. This is for telling
+   *   apart the different models in one repository: the Bonsai release holds a DiT, a text
+   *   encoder and a VAE, and picking the wrong one is worse than reporting nothing found,
+   *   because it fails later and somewhere else. Leave it empty in a single-model
+   *   repository, where whatever is published is by definition the file wanted.
+   * @param gated true when the repository requires accepting a licence and an access token.
+   *   Worth stating in the catalogue rather than discovering as an HTTP 401 halfway through
+   *   a download: the remedy is a person visiting a web page, which no retry will achieve.
    */
   data class HuggingFace(
     val repoId: String,
     val path: String,
     val hints: List<String> = emptyList(),
-  ) : ModelSource
+    val requires: List<String> = emptyList(),
+    val gated: Boolean = false,
+  ) : ModelSource {
+    /**
+     * The file extension to search for when [path] turns out not to exist.
+     *
+     * Derived rather than declared: a `.litertlm` engine bundle, a `.json` tokenizer and a
+     * `.tflite` graph all go through the same resolution path, and defaulting the search to
+     * `.tflite` meant a renamed `.litertlm` could never be found — the listing was fetched
+     * and then filtered down to nothing.
+     */
+    val extension: String get() = "." + path.substringAfterLast('.', "tflite")
+  }
 
   /** Any direct URL — a GitHub release asset, a mirror. */
   data class Direct(val url: String, val origin: String) : ModelSource
@@ -118,22 +138,50 @@ fun chooseModelFile(
   expected: String,
   hints: List<String>,
   extension: String = ".tflite",
+  requires: List<String> = emptyList(),
 ): String? {
-  val candidates = available.filter { it.endsWith(extension, ignoreCase = true) }
+  val candidates = available
+    .filter { it.endsWith(extension, ignoreCase = true) }
+    // A required substring identifies *which* model, so a candidate missing one is a
+    // different graph, not a differently-quantised version of this one.
+    .filter { name -> requires.all { name.contains(it, ignoreCase = true) } }
   if (candidates.isEmpty()) return null
   candidates.firstOrNull { it.equals(expected, ignoreCase = true) }?.let { return it }
 
+  // Hints only rank. A repository that publishes a q8 build where the hints ask for int4
+  // still has exactly one file worth downloading, and returning null there would turn a
+  // usable model into "not found".
   return candidates
     .map { name ->
       val lower = name.lowercase()
       name to hints.count { lower.contains(it.lowercase()) }
     }
-    .filter { (_, score) -> hints.isEmpty() || score > 0 }
     .minWithOrNull(
       compareByDescending<Pair<String, Int>> { it.second }.thenBy { it.first.length }
         .thenBy { it.first },
     )
     ?.first
+}
+
+/**
+ * Puts this device's SoC at the front of a file entry's ranking hints.
+ *
+ * Some repositories publish one bundle per accelerator — `..._mt6991.litertlm`,
+ * `..._sm8750.litertlm`, `..._Google_Tensor_G5.litertlm`. Those are graphs already compiled
+ * for one specific NPU, and on the matching phone one of them is worth more than any
+ * quantisation preference: it is the difference between a model that reaches the APU and
+ * one that falls back to the CPU. So the SoC outranks everything else when it is known.
+ *
+ * A repository with no per-SoC build is unaffected: an unmatched hint only fails to add to
+ * a candidate's score.
+ *
+ * @param socModel `Build.SOC_MODEL`, e.g. "MT6991". Blank, null and the "unknown" the
+ *   platform reports for a device that will not say are all ignored.
+ */
+fun hintsForDevice(declared: List<String>, socModel: String?): List<String> {
+  val soc = socModel?.trim()?.lowercase().orEmpty()
+  if (soc.isEmpty() || soc == "unknown" || soc in declared.map { it.lowercase() }) return declared
+  return listOf(soc) + declared
 }
 
 /**
@@ -154,6 +202,16 @@ data class ModelFile(
   val provenance: Provenance = Provenance.PUBLISHED_LITERT,
 ) {
   val isArchive: Boolean get() = archiveMember != null
+
+  /**
+   * True when this entry's bytes were actually inspected rather than inferred.
+   *
+   * Only a pinned [sha256] means someone downloaded the file and hashed it. Without one,
+   * [sizeBytes] is a figure read off a model card — useful for a progress bar, and no basis
+   * for rejecting a download. Treating a guessed size as a gate turns a slightly stale
+   * catalogue into "nothing downloads", which is exactly what happened.
+   */
+  val verified: Boolean get() = sha256 != null
 
   fun downloadUrl(huggingFaceEndpoint: String = HF_ENDPOINT): String = when (source) {
     is ModelSource.HuggingFace ->
@@ -223,6 +281,9 @@ data class ModelSpec(
  */
 object ModelCatalog {
 
+  /** The converted Bonsai release: three graphs, the tokenizer and the latent statistics. */
+  private const val BONSAI_REPO = "litert-community/Bonsai-Image-ternary-4B"
+
   /**
    * MobileNetV3-Small, int8 — the smoke test that answers "does the NPU work here".
    *
@@ -233,26 +294,28 @@ object ModelCatalog {
    */
   val BENCHMARK_MOBILENET = ModelSpec(
     id = "bench.mobilenet_v3_small_int8",
-    displayName = "MobileNetV3-Small (int8) — NPU smoke test",
+    displayName = "MobileNetV3-Small (int8 weights) — NPU smoke test",
     role = ModelRole.BENCHMARK,
     accelerators = listOf(Accel.NPU, Accel.GPU, Accel.CPU),
     inputShape = intArrayOf(1, 224, 224, 3),
     inputRange = InputRange.UNIT,
     files = listOf(
       ModelFile(
-        fileName = "mobilenet_v3_small_int8.tflite",
+        fileName = "mobilenet_v3_small_wi8.tflite",
         source = ModelSource.HuggingFace(
           repoId = "litert-community/MobileNet-v3-small",
-          path = "mobilenet_v3_small_int8_channelwise.tflite",
-          // The exact name could not be verified when this entry was written, and the guess
-          // was wrong: it 404'd on device. These pick the int8 variant out of the listing
-          // whatever it ends up being called.
-          hints = listOf("int8", "quant"),
+          // Verified against the real repository listing by CI, not guessed. Note the
+          // naming: `wi8` (weight int8), not `int8` - an earlier hint list looking for
+          // "int8" would have missed this file too.
+          path = "mobilenet_v3_small_weight_only_wi8_afp32.tflite",
+          hints = listOf("wi8", "weight_only"),
         ),
         sizeBytes = 0L,
       )
     ),
-    notes = "Channelwise int8 weights and int8 activations — the shape an APU compiles cleanly.",
+    notes = "Weight-only int8 with fp32 activations. That is what the repository publishes; " +
+      "a fully integer graph would suit an APU better, so if the NPU refuses this one, that " +
+      "is the reason rather than a broken NPU path.",
   )
 
   /**
@@ -307,24 +370,50 @@ object ModelCatalog {
     accelerators = listOf(Accel.CPU),
     files = listOf(
       ModelFile(
-        fileName = "bonsai_text_encoder_int4.tflite",
+        fileName = "textenc_int4.tflite",
         source = ModelSource.HuggingFace(
-          "litert-community/Bonsai-Image-ternary-4B", "text_encoder_int4.tflite",
-          hints = listOf("text_encoder", "int4"),
+          BONSAI_REPO, "textenc_int4.tflite",
+          requires = listOf("textenc"), hints = listOf("int4"),
         ),
-        sizeBytes = 1_803_886_592L,
+        // Deliberately 0: the README says "1.68 GiB", which is a rounded figure and not a
+        // size. Only a number someone actually measured belongs here, and CI now prints the
+        // Content-Length of every catalogued file so it can be pinned rather than estimated.
+        sizeBytes = 0L,
       ),
-      // The vocabulary travels with the weights. Ids from a different tokenizer do not
-      // fail - they quietly encode a different prompt - so this is not optional.
+      // Latent BatchNorm statistics and the graph file names. The reference host loop reads
+      // this before anything else, and without the two 128-wide vectors in it the decoded
+      // image comes out washed out rather than wrong in any way that raises an error.
+      ModelFile(
+        fileName = "pipeline_meta.json",
+        source = ModelSource.HuggingFace(
+          BONSAI_REPO, "pipeline_meta.json",
+          requires = listOf("pipeline_meta"),
+        ),
+        sizeBytes = 0L,
+      ),
+      // The vocabulary lives in a `tokenizer/` directory in that repository - CI's listing
+      // showed it - so the path has a prefix and the local name does not.
       ModelFile(
         fileName = "tokenizer.json",
         source = ModelSource.HuggingFace(
-          "litert-community/Bonsai-Image-ternary-4B", "tokenizer.json",
+          BONSAI_REPO, "tokenizer/tokenizer.json",
+          requires = listOf("tokenizer.json"),
+        ),
+        sizeBytes = 0L,
+      ),
+      // Carries the pad token and the chat template. Both are things this app would
+      // otherwise have to assume, and assuming either one shifts every embedding.
+      ModelFile(
+        fileName = "tokenizer_config.json",
+        source = ModelSource.HuggingFace(
+          BONSAI_REPO, "tokenizer/tokenizer_config.json",
+          requires = listOf("tokenizer_config"),
         ),
         sizeBytes = 0L,
       ),
     ),
-    notes = "Only hidden layers 9/18/27 are read, so the top 9 layers and the LM head prune away.",
+    notes = "Only hidden layers 9/18/27 are read, so the top 9 layers and the LM head prune " +
+      "away. Takes 256 prompt tokens wrapped in the Qwen3 chat template.",
   )
 
   val BONSAI_DIT = ModelSpec(
@@ -334,16 +423,18 @@ object ModelCatalog {
     accelerators = listOf(Accel.CPU),
     files = listOf(
       ModelFile(
-        fileName = "bonsai_dit_int4.tflite",
+        fileName = "dit_int4b32.tflite",
         source = ModelSource.HuggingFace(
-          "litert-community/Bonsai-Image-ternary-4B", "dit_int4.tflite",
-          hints = listOf("dit", "int4"),
+          BONSAI_REPO, "dit_int4b32.tflite",
+          // Not `dit_gpu_*`: that is a separate GPU-targeted export of the same weights.
+          requires = listOf("dit"), hints = listOf("int4b32"),
         ),
-        sizeBytes = 2_265_524_224L,
+        sizeBytes = 0L,
       )
     ),
-    notes = "CPU by design: blockwise int4 with dynamic attention is not what an APU " +
-      "accelerates. Needs XNNPACK explicitly attached.",
+    notes = "Not an NPU target: blockwise int4 with dynamic attention is not what an APU " +
+      "accelerates. The repository also publishes dit_gpu_int4b32.tflite, a GPU-targeted " +
+      "export, so GPU is worth trying even though the NPU is not. Needs XNNPACK attached.",
   )
 
   val BONSAI_VAE = ModelSpec(
@@ -354,20 +445,89 @@ object ModelCatalog {
     inputRange = InputRange.SIGNED,
     files = listOf(
       ModelFile(
-        fileName = "bonsai_vae_decoder.tflite",
+        fileName = "vae_dec_fp32.tflite",
         source = ModelSource.HuggingFace(
-          "litert-community/Bonsai-Image-ternary-4B", "vae_decoder.tflite",
-          hints = listOf("vae", "decoder"),
+          BONSAI_REPO, "vae_dec_fp32.tflite",
+          requires = listOf("vae"), hints = listOf("dec", "fp32"),
         ),
-        sizeBytes = 204_010_496L,
+        sizeBytes = 0L,
       )
     ),
     notes = "Convolutional and fixed-shape — the one generator stage worth trying on GPU.",
   )
 
+  /**
+   * Gemma 3 1B, instruction-tuned — a text model small enough to be worth running here.
+   *
+   * LiteRT-LM is a different runtime from the CompiledModel API the vision graphs use: it
+   * owns the KV cache and the decode loop, which is why a chat cannot simply be built out
+   * of the same pieces. It also exposes `Backend.NPU`, so this is the one place where a
+   * generative model really can reach the APU.
+   *
+   * **This repository is gated.** CI found the file exactly where the catalogue says it is,
+   * and a download of it still answers 401: Google requires accepting the Gemma licence,
+   * which is a person visiting a web page and not something a retry can fix. So the app
+   * says that, and Settings takes a Hugging Face token for anyone who has accepted it.
+   *
+   * It stays in the catalogue because of what else the listing showed: this repository
+   * publishes per-SoC NPU builds — `..._mt6991.litertlm`, `..._sm8750.litertlm` and so on.
+   * Those are graphs already compiled for one accelerator, which is the closest thing to a
+   * real answer to "run the text model on the NPU" that exists today. The device's own SoC
+   * is added to the ranking hints at download time, so a phone reporting MT6991 gets the
+   * MT6991 build rather than the generic one.
+   */
+  val LLM_GEMMA3_1B = ModelSpec(
+    id = "llm.gemma3_1b_it",
+    displayName = "Gemma 3 1B Instruct",
+    role = ModelRole.TEXT_CHAT,
+    accelerators = listOf(Accel.NPU, Accel.GPU, Accel.CPU),
+    files = listOf(
+      ModelFile(
+        fileName = "gemma3_1b_it.litertlm",
+        source = ModelSource.HuggingFace(
+          repoId = "litert-community/Gemma3-1B-IT",
+          path = "gemma3-1b-it-int4.litertlm",
+          // Ranked, not required: an int4 build is the one worth having on an APU, but a
+          // repository that only publishes q8 still has exactly one usable file. The
+          // device's SoC is prepended to this list at download time and outranks the rest,
+          // because a graph compiled for this exact accelerator beats a better recipe.
+          hints = listOf("int4", "q4", "ekv1280"),
+          gated = true,
+        ),
+        sizeBytes = 0L,
+      )
+    ),
+    notes = "Needs a Hugging Face token: Google gates this repository behind the Gemma " +
+      "licence. Add one in Settings after accepting it on the model page. In exchange it " +
+      "publishes per-SoC NPU builds — on a MediaTek MT6991 the app picks the MT6991 graph.",
+  )
+
+  val LLM_QWEN3_06B = ModelSpec(
+    id = "llm.qwen3_0_6b",
+    displayName = "Qwen3 0.6B",
+    role = ModelRole.TEXT_CHAT,
+    accelerators = listOf(Accel.NPU, Accel.GPU, Accel.CPU),
+    files = listOf(
+      ModelFile(
+        fileName = "qwen3_0_6b_mixed_int4.litertlm",
+        source = ModelSource.HuggingFace(
+          repoId = "litert-community/Qwen3-0.6B",
+          // Resolved from the repository listing by CI, not guessed.
+          path = "qwen3_0_6b_mixed_int4.litertlm",
+          hints = listOf("int4", "q4"),
+        ),
+        sizeBytes = 0L,
+      )
+    ),
+    notes = "The smaller of the two, ungated, and 475 MiB — a better first try if memory " +
+      "is tight or you would rather not sign anything.",
+  )
+
   /** Everything, for the model-manager screen. */
   val all: List<ModelSpec> = listOf(
     BENCHMARK_MOBILENET,
+    LLM_GEMMA3_1B,
+    LLM_QWEN3_06B,
     UPSCALER_ESRGAN_X4,
     BONSAI_TEXT_ENCODER,
     BONSAI_DIT,

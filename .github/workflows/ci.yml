@@ -5,6 +5,13 @@ on:
     branches: ["**"]
   pull_request:
 
+# A branch with an open PR fires this twice per push, and both copies queue an emulator.
+# Superseded runs are not worth a runner: only the newest commit's result means anything,
+# and the contention made a two-minute build take forty.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   core:
     name: Core tests (no Android SDK)
@@ -62,3 +69,82 @@ jobs:
 
       - name: Assemble debug
         run: ./gradlew :app:assembleDebug --no-daemon
+
+  catalogue:
+    name: Catalogue URLs resolve
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      # A catalogue entry is a claim about someone else's repository. The authoring
+      # environment cannot reach Hugging Face, so that claim went untested three times and
+      # every time it failed on a real phone. CI can reach it, so the check lives here — and
+      # it runs the same resolution the device runs, rather than a stricter one that would
+      # fail entries which actually work.
+      - name: Resolve every catalogued download
+        working-directory: core
+        run: ./gradlew --quiet --console=plain probeCatalog
+
+  smoke:
+    name: App launches on an emulator
+    runs-on: ubuntu-latest
+    # An emulator job legitimately takes several minutes, so "still running" says nothing on
+    # its own. A bound is what makes a genuine hang visible: without one this sits on the
+    # six-hour default, and a stuck check is indistinguishable from a slow one.
+    timeout-minutes: 25
+    # Catches launch crashes of the kind that shipped in v1.1.0: an initialiser-order fault
+    # compiles without a warning, so assembling the APK proves nothing about whether it
+    # opens. Only starting it does.
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Install Android SDK packages
+        run: |
+          set -euo pipefail
+          SDK="${ANDROID_HOME:-$ANDROID_SDK_ROOT}"
+          SDKMANAGER="$(find "$SDK/cmdline-tools" -name sdkmanager -type f | head -1)"
+          yes | "$SDKMANAGER" --licenses > /dev/null 2>&1 || true
+          "$SDKMANAGER" "platforms;android-36" "build-tools;36.0.0"
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      - name: Assemble debug
+        run: ./gradlew :app:assembleDebug --no-daemon
+
+      # KVM is what makes an x86_64 emulator usable rather than glacial.
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: Launch the app and watch for a crash
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 34
+          target: google_apis
+          arch: x86_64
+          # Build the AVD rather than restoring one. The cached `default_boot` snapshot is
+          # shared across runs and written at shutdown, so a run cancelled mid-save can
+          # leave one the emulator cannot load. Cheap insurance against a class of failure
+          # that is invisible from the outside; it costs a couple of minutes per run.
+          force-avd-creation: true
+          emulator-boot-timeout: 600
+          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
+          disable-animations: true
+          # One line on purpose: this action runs the script a line at a time, each in its
+          # own `sh -c`, so anything with a multi-line construct in it is a syntax error.
+          script: bash ./.github/scripts/smoke.sh

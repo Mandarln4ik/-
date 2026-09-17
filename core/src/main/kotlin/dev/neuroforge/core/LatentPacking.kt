@@ -34,6 +34,17 @@ data class LatentSpec(
 
     /** FLUX-family DiT: 16-channel f8 latent packed into 2x2 patches. */
     val FLUX = LatentSpec(channels = 16, vaeScale = 8, patch = 2)
+
+    /**
+     * Bonsai Image 4B, as its reference implementation actually uses it.
+     *
+     * Read from `generate.py` rather than inferred from the architecture name: the VAE
+     * latent is `(1, 32, 64, 64)` and tokens are `(1024, 128)`, so the latent carries 32
+     * channels, not the 16 a FLUX-family model would suggest. Assuming the family's
+     * defaults here produced a token tensor of the wrong width, which the graph would
+     * accept and turn into noise.
+     */
+    val BONSAI = LatentSpec(channels = 32, vaeScale = 8, patch = 2)
   }
 }
 

@@ -31,6 +31,42 @@ class BpeTokenizerTest {
   }
 
   @Test
+  fun `added tokens are emitted whole instead of being merged`() {
+    // A chat marker is an id the model was handed, not text to segment. Without literal
+    // matching the vocabulary here would BPE "<|im_start|>" into ordinary punctuation and
+    // the encoder would read the conversation frame as content.
+    val vocab = mapOf("a" to 0, "b" to 1, "<" to 2, "|" to 3, ">" to 4, "im" to 5)
+    val tok = BpeTokenizer(
+      vocab,
+      merges = emptyList(),
+      specialTokens = mapOf("<|im_start|>" to 99),
+    )
+    assertContentEquals(intArrayOf(0, 99, 1), tok.encode("a<|im_start|>b"))
+  }
+
+  @Test
+  fun `a longer added token wins over one that is its prefix`() {
+    val tok = BpeTokenizer(
+      mapOf("a" to 0),
+      merges = emptyList(),
+      specialTokens = mapOf("<|im" to 7, "<|im_start|>" to 8),
+    )
+    assertContentEquals(intArrayOf(8), tok.encode("<|im_start|>"))
+    assertContentEquals(intArrayOf(7), tok.encode("<|im"))
+  }
+
+  @Test
+  fun `text between added tokens is still byte-pair encoded as one run`() {
+    // Splitting on the marker must not also split the surrounding words, or merges would
+    // stop at an arbitrary boundary and the ids would drift from the reference.
+    val vocab = mapOf("a" to 0, "b" to 1, "ab" to 2)
+    val plain = BpeTokenizer(vocab, listOf("a" to "b"))
+    val withSpecials = BpeTokenizer(vocab, listOf("a" to "b"), specialTokens = mapOf("<s>" to 9))
+    assertContentEquals(plain.encode("ab"), withSpecials.encode("ab"))
+    assertContentEquals(intArrayOf(9, 2), withSpecials.encode("<s>ab"))
+  }
+
+  @Test
   fun `merges are applied by rank not left to right`() {
     // "ab" ranks after "bc", so a greedy left-to-right pass would wrongly produce [ab, c].
     val vocab = mapOf("a" to 0, "b" to 1, "c" to 2, "ab" to 3, "bc" to 4, "abc" to 5)

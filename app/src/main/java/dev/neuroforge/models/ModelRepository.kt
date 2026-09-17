@@ -5,6 +5,7 @@ import android.util.Log
 import dev.neuroforge.core.ModelFile
 import dev.neuroforge.core.ModelSource
 import dev.neuroforge.core.chooseModelFile
+import dev.neuroforge.core.hintsForDevice
 import dev.neuroforge.core.ModelSpec
 import dev.neuroforge.core.Provenance
 import dev.neuroforge.core.Tar
@@ -69,6 +70,29 @@ class ModelRepository(private val context: Context) {
 
   private val root: File = File(context.filesDir, "models").apply { mkdirs() }
 
+  /**
+   * Hugging Face access token, or null.
+   *
+   * Some repositories are gated behind a licence the user has to accept in a browser —
+   * Google's Gemma terms, for one. No amount of retrying gets past that; a token from
+   * someone who has accepted it does. Held here rather than baked in for the obvious
+   * reason, and never logged.
+   */
+  @Volatile var accessToken: String? = null
+
+  /**
+   * This device's SoC, lowercased, or null.
+   *
+   * Used to rank a repository's per-accelerator builds. Read once: it cannot change while
+   * the process is alive.
+   */
+  private val socModel: String? = runCatching { android.os.Build.SOC_MODEL }.getOrNull()
+
+  /** Adds the access token when there is one. */
+  private fun Request.Builder.authorized(): Request.Builder = apply {
+    accessToken?.takeIf { it.isNotBlank() }?.let { header("Authorization", "Bearer $it") }
+  }
+
   private val http: OkHttpClient by lazy {
     OkHttpClient.Builder()
       .connectTimeout(30, TimeUnit.SECONDS)
@@ -101,7 +125,9 @@ class ModelRepository(private val context: Context) {
     if (target.isFile) {
       // For an archive the stored size describes the download, not the extracted member,
       // so only a direct download can be length-checked here.
-      if (!file.isArchive && file.sizeBytes > 0 && target.length() != file.sizeBytes) {
+      if (file.verified && !file.isArchive && file.sizeBytes > 0 &&
+        target.length() != file.sizeBytes
+      ) {
         return ModelState.Corrupt(
           "expected ${file.sizeBytes} bytes, found ${target.length()} — delete and re-download"
         )
@@ -133,13 +159,11 @@ class ModelRepository(private val context: Context) {
 
     val digest = MessageDigest.getInstance("SHA-256")
     val url = resolveUrl(file)
-    val request = Request.Builder().url(url).build()
+    val request = Request.Builder().url(url).authorized().build()
 
     http.newCall(request).execute().use { response ->
       if (!response.isSuccessful) {
-        throw IOException(
-          "HTTP ${response.code} fetching ${file.fileName} from ${file.originLabel()}"
-        )
+        throw IOException(describeFailure(response.code, file))
       }
       val body = response.body ?: throw IOException("empty body for ${file.fileName}")
       val total = body.contentLength().takeIf { it > 0 } ?: file.sizeBytes
@@ -173,10 +197,27 @@ class ModelRepository(private val context: Context) {
       emit(DownloadProgress(file.fileName, written, total, rate))
     }
 
-    if (file.sizeBytes > 0 && part.length() != file.sizeBytes) {
+    if (part.length() == 0L) {
       part.delete()
       throw IOException(
-        "${file.fileName}: downloaded ${part.length()} bytes, catalogue expects ${file.sizeBytes}"
+        "${file.fileName}: the server returned an empty body from ${file.originLabel()}. " +
+          "The file may have been renamed or made private."
+      )
+    }
+    // Only a verified entry may reject on size. An unverified sizeBytes came off a model
+    // card, and holding a download to a number nobody checked turns a stale catalogue into
+    // a dead Download button.
+    if (file.verified && file.sizeBytes > 0 && part.length() != file.sizeBytes) {
+      part.delete()
+      throw IOException(
+        "${file.fileName}: downloaded ${part.length()} bytes, expected ${file.sizeBytes}"
+      )
+    }
+    if (!file.verified && file.sizeBytes > 0 && part.length() != file.sizeBytes) {
+      Log.i(
+        TAG,
+        "${file.fileName}: ${part.length()} bytes, catalogue said ${file.sizeBytes} " +
+          "(unverified figure, accepting)",
       )
     }
 
@@ -223,7 +264,15 @@ class ModelRepository(private val context: Context) {
           "be listed. Check the model page, or side-load the file."
       )
     }
-    val chosen = chooseModelFile(available, source.path, source.hints)
+    // Search for the extension this entry actually has. Defaulting to `.tflite` here meant
+    // a renamed `.litertlm` bundle or a moved `tokenizer.json` was fetched, listed, and
+    // then filtered down to nothing.
+    // The device's own SoC outranks the catalogue's hints: a repository that publishes one
+    // bundle per accelerator has a build compiled for this exact NPU, and that is worth
+    // more than any quantisation preference.
+    val ranked = hintsForDevice(source.hints, socModel)
+    val chosen =
+      chooseModelFile(available, source.path, ranked, source.extension, source.requires)
       ?: throw IOException(
         "'${source.path}' was not found in ${source.repoId}. It contains: " +
           available.joinToString(", ").take(400)
@@ -232,17 +281,55 @@ class ModelRepository(private val context: Context) {
     return "${ModelFile.HF_ENDPOINT}/${source.repoId}/resolve/main/$chosen?download=true"
   }
 
-  /** True when the URL exists; a failed probe is treated as "present" so a flaky network
-   *  does not trigger a pointless listing and a misleading error. */
+  /**
+   * True only when the URL answers 2xx.
+   *
+   * An earlier version accepted anything that was not a 404, which let a 401 on a gated
+   * repository through as "present" and turned an access problem into an empty download.
+   * A failed probe (no network) still counts as present, so a flaky connection does not
+   * trigger a pointless listing and a misleading error.
+   */
   private fun headOk(url: String): Boolean = runCatching {
-    http.newCall(Request.Builder().url(url).head().build()).execute()
-      .use { it.isSuccessful || it.code != 404 }
+    http.newCall(Request.Builder().url(url).head().authorized().build())
+      .execute().use { it.isSuccessful }
   }.getOrDefault(true)
 
-  /** File paths at the root of a Hugging Face model repository. */
+  /**
+   * Turns an HTTP status into something the person holding the phone can act on.
+   *
+   * A gated repository answers 401 or 403, and the remedy is not a retry — it is visiting
+   * the model page, accepting the licence, and pasting a token into Settings. Reporting
+   * that as "HTTP 401" leaves someone pressing Download again.
+   */
+  private fun describeFailure(code: Int, file: ModelFile): String {
+    val source = file.source
+    val gated = source is ModelSource.HuggingFace && source.gated
+    return when {
+      code == 401 || code == 403 -> buildString {
+        append("${file.originLabel()} refused the download (HTTP $code). ")
+        if (gated) {
+          append("This repository is gated: open its page on Hugging Face, accept the ")
+          append("licence, then paste an access token into Settings.")
+        } else if (accessToken.isNullOrBlank()) {
+          append("It may need a Hugging Face access token — Settings has a field for one.")
+        } else {
+          append("The token in Settings does not grant access to it.")
+        }
+      }
+      code == 404 -> "${file.fileName} is no longer in ${file.originLabel()} (HTTP 404)."
+      else -> "HTTP $code fetching ${file.fileName} from ${file.originLabel()}"
+    }
+  }
+
+  /**
+   * Every file path in a Hugging Face model repository, subdirectories included.
+   *
+   * Recursive because the tokenizer these pipelines need sits in a `tokenizer/` directory,
+   * and a root-only listing reports the repository as not containing it.
+   */
   private fun listHuggingFaceFiles(repoId: String): List<String> = runCatching {
-    val url = "${ModelFile.HF_ENDPOINT}/api/models/$repoId/tree/main"
-    http.newCall(Request.Builder().url(url).build()).execute().use { response ->
+    val url = "${ModelFile.HF_ENDPOINT}/api/models/$repoId/tree/main?recursive=true"
+    http.newCall(Request.Builder().url(url).authorized().build()).execute().use { response ->
       if (!response.isSuccessful) return emptyList()
       val body = response.body?.string().orEmpty()
       val array = JSONArray(body)

@@ -74,9 +74,25 @@ class CatalogTest {
 
   @Test
   fun `hugging face urls point at the file inside its repo`() {
+    // The path is the one CI observed in the real repository listing. Every name here was
+    // wrong before that check existed - dit_int4, vae_decoder, text_encoder_int4 - so this
+    // asserts the verified spelling rather than the plausible one.
     assertEquals(
-      "https://huggingface.co/litert-community/Bonsai-Image-ternary-4B/resolve/main/dit_int4.tflite?download=true",
+      "https://huggingface.co/litert-community/Bonsai-Image-ternary-4B/resolve/main/dit_int4b32.tflite?download=true",
       ModelCatalog.BONSAI_DIT.files.single().downloadUrl(),
+    )
+  }
+
+  @Test
+  fun `no size is pinned unless the file was actually inspected`() {
+    // Sizes read off a model card turned a stale catalogue into a dead Download button.
+    // A size may only be a gate when a checksum proves someone downloaded the file.
+    val unverifiedWithSize = ModelCatalog.all
+      .flatMap { it.files }
+      .filter { !it.verified && it.sizeBytes > 0 }
+    assertTrue(
+      unverifiedWithSize.isEmpty(),
+      "these carry an unverified size: ${unverifiedWithSize.map { it.fileName }}",
     )
   }
 
@@ -184,10 +200,52 @@ class CatalogTest {
   }
 
   @Test
-  fun `nothing matching the hints returns null rather than a wrong file`() {
+  fun `a required substring excludes a different model in the same repository`() {
     // Downloading the wrong graph is worse than failing: it fails later, inside the loader.
+    // The Bonsai release is one repository holding a DiT, a text encoder and a VAE.
+    val files = listOf("dit_int4b32.tflite", "textenc_int4.tflite", "vae_dec_fp32.tflite")
+    assertEquals(
+      "textenc_int4.tflite",
+      chooseModelFile(files, "renamed.tflite", hints = listOf("int4"), requires = listOf("textenc")),
+    )
+    assertNull(
+      chooseModelFile(files, "renamed.tflite", hints = emptyList(), requires = listOf("unet")),
+    )
+  }
+
+  @Test
+  fun `a hint that nothing matches still yields the one usable file`() {
+    // The opposite failure: a repository publishing only a q8 build when the hint asks for
+    // int4 has exactly one file worth downloading, and "not found" would be wrong.
     val files = listOf("model_fp32.tflite")
-    assertNull(chooseModelFile(files, "model_int8.tflite", listOf("int8")))
+    assertEquals("model_fp32.tflite", chooseModelFile(files, "model_int8.tflite", listOf("int8")))
+  }
+
+  @Test
+  fun `the extension searched for follows the entry's own path`() {
+    // Defaulting this to .tflite meant a renamed .litertlm bundle was listed and then
+    // filtered down to nothing, which reads as "the repository is empty".
+    val source = ModelSource.HuggingFace("owner/repo", "qwen3-0.6b-int4.litertlm")
+    assertEquals(".litertlm", source.extension)
+    assertEquals(".json", ModelSource.HuggingFace("o/r", "tokenizer/tokenizer.json").extension)
+    assertEquals(".tflite", ModelSource.HuggingFace("o/r", "noextension").extension)
+
+    val listing = listOf("Qwen3-0.6B_seq128_q8_ekv1280.litertlm", "README.md")
+    assertEquals(
+      "Qwen3-0.6B_seq128_q8_ekv1280.litertlm",
+      chooseModelFile(listing, source.path, listOf("int4"), source.extension),
+    )
+  }
+
+  @Test
+  fun `a subdirectory path resolves against a recursive listing`() {
+    val listing = listOf("pipeline_meta.json", "tokenizer/tokenizer.json", "tokenizer/vocab.json")
+    assertEquals(
+      "tokenizer/tokenizer.json",
+      chooseModelFile(
+        listing, "tokenizer/tokenizer.json", emptyList(), ".json", listOf("tokenizer.json"),
+      ),
+    )
   }
 
   @Test
@@ -205,6 +263,54 @@ class CatalogTest {
     assertEquals("512 B", formatBytes(512))
     assertEquals("1.0 KiB", formatBytes(1024))
     assertEquals("2.1 GiB", formatBytes(2_265_524_224L))
+  }
+
+  @Test
+  fun `the device SoC outranks every other hint`() {
+    // litert-community publishes one bundle per accelerator. On a phone reporting MT6991
+    // the MT6991 graph is worth more than a better quantisation recipe, because it is the
+    // one that was compiled for this APU.
+    val listing = listOf(
+      "Gemma3-1B-IT_q4_ekv1280_mt6989.litertlm",
+      "Gemma3-1B-IT_q4_ekv1280_mt6991.litertlm",
+      "Gemma3-1B-IT_q4_ekv1280_sm8750.litertlm",
+      "gemma3-1b-it-int4.litertlm",
+    )
+    val hints = hintsForDevice(listOf("int4", "q4", "ekv1280"), "MT6991")
+    assertEquals("mt6991", hints.first())
+    assertEquals(
+      "Gemma3-1B-IT_q4_ekv1280_mt6991.litertlm",
+      chooseModelFile(listing, "not-published-any-more.litertlm", hints, ".litertlm"),
+    )
+  }
+
+  @Test
+  fun `an unknown SoC leaves the hints alone`() {
+    val declared = listOf("int4", "q4")
+    assertEquals(declared, hintsForDevice(declared, null))
+    assertEquals(declared, hintsForDevice(declared, ""))
+    assertEquals(declared, hintsForDevice(declared, "unknown"))
+    assertEquals(declared, hintsForDevice(declared, "  UNKNOWN "))
+  }
+
+  @Test
+  fun `a SoC with no matching build changes nothing`() {
+    // An unmatched hint only fails to add to a score, so a repository that publishes one
+    // generic bundle behaves exactly as before.
+    val listing = listOf("qwen3_0_6b_mixed_int4.litertlm", "qwen3_0_6b_f32.litertlm")
+    val hints = hintsForDevice(listOf("int4"), "MT6991")
+    assertEquals(
+      "qwen3_0_6b_mixed_int4.litertlm",
+      chooseModelFile(listing, "gone.litertlm", hints, ".litertlm"),
+    )
+  }
+
+  @Test
+  fun `a gated repository is marked as such rather than discovered as a 401`() {
+    val gemma = ModelCatalog.LLM_GEMMA3_1B.files.single().source as ModelSource.HuggingFace
+    assertTrue(gemma.gated, "the Gemma repository requires accepting Google's licence")
+    val qwen = ModelCatalog.LLM_QWEN3_06B.files.single().source as ModelSource.HuggingFace
+    assertTrue(!qwen.gated)
   }
 
   private fun assertContentEqualsInt(expected: IntArray, actual: IntArray) {

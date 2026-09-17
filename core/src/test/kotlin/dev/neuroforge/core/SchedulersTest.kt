@@ -106,10 +106,79 @@ class SchedulersTest {
   }
 
   @Test
+  fun `the empirical shift matches the reference formula`() {
+    // Spot-checked against generate.py's compute_empirical_mu for the 1024-token,
+    // 4-step configuration this model ships with.
+    val mu = run {
+      val m200 = 0.00016927 * 1024 + 0.45666666
+      val m10 = 8.73809524e-05 * 1024 + 1.89833333
+      val a = (m200 - m10) / 190.0
+      a * 4 + (m200 - 200.0 * a)
+    }
+    assertEquals(kotlin.math.exp(mu).toFloat(), empiricalShift(1024, 4), 1e-4f)
+  }
+
+  @Test
+  fun `the empirical shift is far from the 3 point 0 this code used to assume`() {
+    // The point of computing it: the hardcoded value was not close, so every sigma in the
+    // schedule was wrong by enough to matter.
+    val computed = empiricalShift(tokens = 1024, steps = 4)
+    assertTrue(kotlin.math.abs(computed - 3.0f) > 0.5f, "computed shift was $computed")
+  }
+
+  @Test
+  fun `timestep equals sigma for flow matching`() {
+    // Not sigma * numTrainTimesteps: this family states timestep == sigma, and the
+    // SD-family convention would hand the graph a number 1000x too large.
+    val s = FlowMatchEulerScheduler(numInferenceSteps = 4, shift = empiricalShift(1024, 4))
+    s.steps.forEach { assertEquals(it.sigma, it.timestep, 1e-6f) }
+  }
+
+  @Test
+  fun `the bonsai sigma ladder matches the reference host loop`() {
+    // Golden values from generate.py's flowmatch_sigmas(4) with TOKENS = 1024. This is the
+    // whole schedule, not a property of it: the previous implementation was monotonic,
+    // started at 1 and ended at 0, and was still wrong at every interior point because it
+    // ramped down to 1/numTrainTimesteps instead of 1/steps.
+    val expected = floatArrayOf(1.000000f, 0.958085f, 0.883982f, 0.717497f)
+    val actual = FlowMatchEulerScheduler.forImage(Bonsai.TOKENS, 4).steps.map { it.sigma }
+    assertEquals(expected.size, actual.size)
+    expected.forEachIndexed { i, e -> assertEquals(e, actual[i], 1e-5f, "sigma $i") }
+  }
+
+  @Test
+  fun `the sigma ladder ramps to one over steps, not one over a thousand`() {
+    // The distinguishing check: the unshifted ladder's last entry is the linspace endpoint.
+    // With the SD convention it would be 0.001 regardless of step count.
+    val last = FlowMatchEulerScheduler(numInferenceSteps = 4, shift = 1.0f).steps.last().sigma
+    assertEquals(0.25f, last, 1e-6f)
+    assertEquals(0.125f, FlowMatchEulerScheduler(8, shift = 1.0f).steps.last().sigma, 1e-6f)
+  }
+
+  @Test
+  fun `forImage derives the shift instead of taking one`() {
+    val derived = FlowMatchEulerScheduler.forImage(Bonsai.TOKENS, 4)
+    val explicit = FlowMatchEulerScheduler(4, shift = empiricalShift(Bonsai.TOKENS, 4))
+    derived.steps.forEachIndexed { i, step ->
+      assertEquals(explicit.steps[i].sigma, step.sigma, 1e-6f)
+    }
+    assertEquals(7.61934f, empiricalShift(Bonsai.TOKENS, 4), 1e-4f)
+  }
+
+  @Test
+  fun `bonsai latent geometry matches the reference tensors`() {
+    // generate.py: tokens are (1024, 128) and the VAE latent is (1, 32, 64, 64).
+    val spec = LatentSpec.BONSAI
+    assertEquals(1024, spec.tokenCount(512, 512))
+    assertEquals(128, spec.tokenDim())
+    assertEquals(32 * 64 * 64, spec.latentElements(512, 512))
+  }
+
+  @Test
   fun `single step schedules are valid`() {
     // A 1-step run is a legitimate configuration for a step-distilled model; it must not
     // divide by zero while building the linspace.
-    val flow = FlowMatchEulerScheduler(numInferenceSteps = 1)
+    val flow = FlowMatchEulerScheduler.forImage(tokens = 1024, steps = 1)
     assertEquals(1, flow.steps.size)
     val x = floatArrayOf(5f)
     flow.step(0, x, floatArrayOf(1f), Pcg32(0))

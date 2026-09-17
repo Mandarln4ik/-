@@ -6,6 +6,7 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.RadioButton
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -29,6 +30,7 @@ import dev.neuroforge.core.ModelCatalog
 @Composable
 fun SettingsScreen(vm: AppViewModel, state: UiState) {
   val policy by vm.policy.collectAsStateWithLifecycle()
+  val token by vm.hfToken.collectAsStateWithLifecycle()
 
   LazyColumn(Modifier.fillMaxSize()) {
     item {
@@ -54,6 +56,29 @@ fun SettingsScreen(vm: AppViewModel, state: UiState) {
             }
           }
         }
+      }
+    }
+
+    item {
+      SectionCard("Hugging Face access token") {
+        Text(
+          "Only needed for gated repositories — Gemma is one: Google requires accepting " +
+            "its licence on the model page first. Everything else downloads without a " +
+            "token. Stored in this app's private settings and sent only to " +
+            "huggingface.co.",
+          style = MaterialTheme.typography.bodySmall,
+          color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        OutlinedTextField(
+          value = token,
+          onValueChange = vm::setHfToken,
+          modifier = Modifier.fillMaxWidth().padding(top = 10.dp),
+          singleLine = true,
+          label = { Text("hf_…") },
+          // Not masked: a read token for a public model hub is not a password, and being
+          // able to see what was pasted is worth more here than hiding it.
+          placeholder = { Text("leave empty unless a download says otherwise") },
+        )
       }
     }
 

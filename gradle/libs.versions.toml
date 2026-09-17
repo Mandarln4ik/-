@@ -13,6 +13,7 @@ datastore = "1.1.1"
 # LiteRT (formerly TensorFlow Lite). 2.1.6 is the version the official NPU samples
 # pin; the NPU runtime .so files shipped by the vendor must match this major.minor.
 litert = "2.1.6"
+litertlm = "0.16.1"
 
 junit = "4.13.2"
 androidxJunit = "1.1.5"
@@ -38,6 +39,7 @@ kotlinx-serialization-json = { group = "org.jetbrains.kotlinx", name = "kotlinx-
 okhttp = { group = "com.squareup.okhttp3", name = "okhttp", version.ref = "okhttp" }
 
 litert = { group = "com.google.ai.edge.litert", name = "litert", version.ref = "litert" }
+litertlm = { group = "com.google.ai.edge.litertlm", name = "litertlm-android", version.ref = "litertlm" }
 
 junit = { group = "junit", name = "junit", version.ref = "junit" }
 androidx-junit = { group = "androidx.test.ext", name = "junit", version.ref = "androidxJunit" }

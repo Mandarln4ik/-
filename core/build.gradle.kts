@@ -22,6 +22,15 @@ dependencies {
   testImplementation(kotlin("test"))
 }
 
+// Resolves every catalogued download against the live repositories, running the same
+// `chooseModelFile` the device runs. In the test source set so no HTTP code ships in the app.
+tasks.register<JavaExec>("probeCatalog") {
+  group = "verification"
+  mainClass.set("dev.neuroforge.core.CatalogProbeKt")
+  classpath = sourceSets["test"].runtimeClasspath
+  dependsOn(tasks.named("testClasses"))
+}
+
 tasks.test {
   useJUnitPlatform()
   testLogging { events("failed", "skipped") }
