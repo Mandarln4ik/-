@@ -3,6 +3,8 @@ package dev.neuroforge.models
 import android.content.Context
 import android.util.Log
 import dev.neuroforge.core.Accel
+import dev.neuroforge.core.Attachment
+import dev.neuroforge.core.AttachmentKind
 import dev.neuroforge.core.Chat
 import dev.neuroforge.core.ChatKind
 import dev.neuroforge.core.ChatMessage
@@ -68,6 +70,25 @@ class ChatStore(context: Context) {
                     put("millis", m.millis)
                     put("timestamp", m.timestamp)
                     m.thinking?.let { put("thinking", it) }
+                    if (m.attachments.isNotEmpty()) {
+                      put(
+                        "attachments",
+                        JSONArray().apply {
+                          m.attachments.forEach { a ->
+                            put(
+                              JSONObject().apply {
+                                put("id", a.id)
+                                put("fileName", a.fileName)
+                                put("kind", a.kind.name)
+                                put("localPath", a.localPath)
+                                put("sizeBytes", a.sizeBytes)
+                                put("mimeType", a.mimeType)
+                              }
+                            )
+                          }
+                        },
+                      )
+                    }
                     m.stats?.let { st ->
                       put(
                         "stats",
@@ -76,6 +97,7 @@ class ChatStore(context: Context) {
                           put("decode", st.decodeMillis)
                           put("tokens", st.tokens)
                           put("stop", st.stop.name)
+                          put("estimated", st.tokensEstimated)
                           st.detail?.let { put("detail", it) }
                         },
                       )
@@ -107,6 +129,20 @@ class ChatStore(context: Context) {
             millis = m.optLong("millis"),
             timestamp = m.optLong("timestamp"),
             thinking = m.optString("thinking").takeIf { it.isNotBlank() },
+            attachments = m.optJSONArray("attachments")?.let { arr ->
+              (0 until arr.length()).mapNotNull { k ->
+                val a = arr.optJSONObject(k) ?: return@mapNotNull null
+                Attachment(
+                  id = a.optString("id"),
+                  fileName = a.optString("fileName"),
+                  kind = enumOrNull<AttachmentKind>(a.optString("kind"))
+                    ?: return@mapNotNull null,
+                  localPath = a.optString("localPath"),
+                  sizeBytes = a.optLong("sizeBytes"),
+                  mimeType = a.optString("mimeType"),
+                )
+              }
+            }.orEmpty(),
             // Absent for every reply written before this was recorded; the UI simply shows
             // no telemetry line for those rather than inventing zeroes.
             stats = m.optJSONObject("stats")?.let { st ->
@@ -115,6 +151,9 @@ class ChatStore(context: Context) {
                 decodeMillis = st.optLong("decode"),
                 tokens = st.optInt("tokens"),
                 stop = enumOrNull<StopReason>(st.optString("stop")) ?: StopReason.COMPLETE,
+                // Replies stored before the distinction existed carry no flag; treating
+                // those as estimated keeps the tilde, which is the honest default.
+                tokensEstimated = st.optBoolean("estimated", true),
                 detail = st.optString("detail").takeIf { d -> d.isNotBlank() },
               )
             },

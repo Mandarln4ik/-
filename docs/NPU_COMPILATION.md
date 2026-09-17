@@ -18,15 +18,57 @@ python3 tools/npu/compile_for_npu.py model.tflite --soc MT6991 --out ./npu
 
 ## Где это может работать, а где нет
 
-**Только x86_64 Linux.** Это не предположение — проверено распаковкой обоих колёс:
+**Только x86_64 Linux** — но причина не та, которую я написал здесь в прошлый раз, и это
+важно. Проверено распаковкой колёс `ai-edge-litert` 2.2.0:
 
-| файл | x86_64 | aarch64 |
+| `.so` в колесе | x86_64 | aarch64 |
 |---|---|---|
-| `vendors/mediatek/compiler/libLiteRtCompilerPlugin_MediaTek.so` | **есть** | **нет** |
+| `libLiteRtCompilerPlugin_MediaTek.so` | **есть** | нет |
+| `libLiteRtCompilerPlugin_Qualcomm.so` | есть | нет |
+| `libLiteRtCompilerPlugin_Samsung.so` | есть | нет |
+| `libLiteRtCompilerPlugin_google_tensor.so` | есть | нет |
+| `libLiteRtCompilerPlugin_IntelOpenvino.so` | есть | нет |
 
-То есть **на самом телефоне это не запустится**, сколько бы остального тулчейна ни вставало
-в Termux: именно тот кусок, который компилирует, под ARM не собран. Нужен десктоп, CI-раннер
-или Colab — а результат копируется на телефон файлом.
+Под ARM не собран **ни один** вендорный плагин компиляции, не только MediaTek. Python-часть
+(`aot/vendors/mediatek/mediatek_backend.py`) в обоих колёсах одинаковая — нет именно
+нативной библиотеки, которую она грузит. А `ai-edge-litert-sdk-mediatek` и не пытается:
+в его `setup.py` стоит явная проверка
+
+```python
+IS_X86_ARCHITECTURE = platform.machine() in ('x86_64', 'i386', 'i686')
+...
+print('IGNORED: Currently LiteRT NPU AOT for MediaTek is only supported on'
+      ' Linux x86 architecture.')
+```
+
+### Но у MediaTek ARM-сборка есть
+
+Тот же `setup.py` качает NeuroPilot SDK с S3 MediaTek (66 МБ). Внутри — две разные вещи:
+
+| путь | что это | архитектура |
+|---|---|---|
+| `host/lib/libneuron_adapter.so` | компилятор для хоста | **только x86_64** |
+| `usdk/lib64/libneuronusdk_adapter.so` | рантайм для устройства | **AArch64** |
+
+И вот что интересно: у них **совпадающий набор экспортов** — 104 символа `Neuron*`, из них
+30 `NeuronCompilation_*`, включая `NeuronCompilation_create`, `_createWithOptions`,
+`_finish`. Списки идентичны, я сравнивал `nm -D` побайтово. ARM-файл — настоящий ELF на
+14 МБ, не заглушка.
+
+То есть **компилирующий API у MediaTek под ARM есть**. Нет — плагина LiteRT, который его
+вызывает. Дырка в упаковке у Google, а не отсутствие компилятора у MediaTek.
+
+Практически это значит:
+
+* Сегодня AOT всё равно нужен x86_64 — десктоп, CI-раннер или Colab, результат копируется
+  файлом. Ниже есть workflow, который делает это за вас.
+* «На телефоне невозможно» — неверно как утверждение о железе. Возможных путей два: собрать
+  `libLiteRtCompilerPlugin_MediaTek.so` под aarch64 из исходников LiteRT, либо звать
+  NeuronAdapter напрямую мимо LiteRT AOT. Ни то, ни другое здесь не сделано и не проверено,
+  поэтому в приложении этого нет.
+* JIT-путь, который приложение уже использует, компилирует на устройстве при первой загрузке
+  ровно через этот ARM-адаптер. Так что компиляция на телефоне **уже происходит**; AOT лишь
+  убирает её с критического пути.
 
 `ai-edge-litert-sdk-mediatek` даёт `libneuron_adapter.so` из MediaTek NeuroPilot SDK. Без
 него плагин загрузится, опознает чип (`SoC model mt6991 is supported`) и упадёт на

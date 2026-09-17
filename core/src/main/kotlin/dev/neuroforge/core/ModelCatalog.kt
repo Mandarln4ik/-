@@ -247,6 +247,16 @@ data class ModelSpec(
   val tileSize: Int? = null,
   val scale: Int = 1,
   val notes: String = "",
+  /**
+   * Whether this model can be shown an image.
+   *
+   * A property of the weights, not of the runtime: LiteRT-LM can carry a vision tower, but
+   * a text-only Gemma 3 1B bundle running on it still cannot see anything. Attaching a
+   * photo to a chat with a model that has no vision tower produces either an error from the
+   * engine or, worse, a confident answer about an image it never received — so the app
+   * checks this before sending rather than finding out afterwards.
+   */
+  val vision: Boolean = false,
 ) {
   val totalBytes: Long get() = files.sumOf { it.sizeBytes }
 
@@ -682,6 +692,40 @@ object ModelCatalog {
       "llama.cpp backend, and small enough that its answers show it.",
   )
 
+  /**
+   * Gemma 3n E2B — the vision model.
+   *
+   * The only thing in this catalogue that can be shown a photo. LiteRT-LM carries the
+   * vision tower and starts a separate vision executor for it; everything else here is
+   * text-only, which is why [ModelSpec.vision] is a per-model flag rather than a backend
+   * one.
+   *
+   * E2B rather than E4B: "effective 2B" is what it costs to run, and the larger sibling
+   * does not fit alongside a vision tower on a phone with other apps alive.
+   */
+  val LLM_GEMMA3N_E2B = ModelSpec(
+    id = "llm.gemma3n_e2b",
+    displayName = "Gemma 3n E2B (vision)",
+    role = ModelRole.TEXT_CHAT,
+    accelerators = listOf(Accel.NPU, Accel.GPU, Accel.CPU),
+    vision = true,
+    files = listOf(
+      ModelFile(
+        fileName = "gemma3n_e2b_it.litertlm",
+        source = ModelSource.HuggingFace(
+          repoId = "google/gemma-3n-E2B-it-litert-lm",
+          path = "gemma-3n-E2B-it-int4.litertlm",
+          hints = listOf("int4", "q4"),
+          gated = true,
+        ),
+        sizeBytes = 0L,
+      )
+    ),
+    notes = "The one model here that can look at a photo. Needs a Hugging Face token: " +
+      "Google gates it behind the Gemma licence. Attaching an image to any other model " +
+      "is refused rather than silently ignored.",
+  )
+
   /** Everything, for the model-manager screen. */
   val all: List<ModelSpec> = listOf(
     BENCHMARK_MOBILENET,
@@ -691,6 +735,7 @@ object ModelCatalog {
     LLM_SMOLLM2_135M_PTE,
     LLM_GEMMA3_1B_GGUF,
     LLM_QWEN25_05B_GGUF,
+    LLM_GEMMA3N_E2B,
     UPSCALER_ESRGAN_X4,
     BONSAI_TEXT_ENCODER,
     BONSAI_DIT,

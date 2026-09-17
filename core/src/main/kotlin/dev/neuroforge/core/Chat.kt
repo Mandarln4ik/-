@@ -39,6 +39,10 @@ enum class Speaker { USER, MODEL }
  *   different question — "how did it get here" instead of "what did it say".
  * @param stats what the reply cost. Null for a user turn and for replies from before this
  *   was recorded.
+ * @param attachments files sent with a user turn. Kept on the message rather than only in
+ *   the prompt so the bubble can show what was sent: a folded-in text file is invisible in
+ *   the prompt text, and reopening a chat months later should still say which file the
+ *   question was about.
  */
 data class ChatMessage(
   val speaker: Speaker,
@@ -49,6 +53,7 @@ data class ChatMessage(
   val timestamp: Long = 0,
   val thinking: String? = null,
   val stats: ReplyStats? = null,
+  val attachments: List<Attachment> = emptyList(),
 )
 
 /**

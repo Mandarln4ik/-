@@ -6,21 +6,35 @@ import androidx.compose.animation.expandVertically
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.shrinkVertically
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.AttachFile
+import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.Description
 import androidx.compose.material.icons.filled.ExpandMore
+// Deliberately Photo rather than Image: `androidx.compose.foundation.Image` is the
+// composable this file uses to draw a thumbnail, and importing an icon of the same name
+// puts two different `Image` declarations in scope for no benefit.
+import androidx.compose.material.icons.filled.Photo
 import androidx.compose.material.icons.filled.Tune
+import androidx.compose.material3.AssistChip
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
@@ -37,6 +51,7 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -48,6 +63,8 @@ import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import android.graphics.BitmapFactory
+import dev.neuroforge.core.Attachment
+import dev.neuroforge.core.AttachmentKind
 import dev.neuroforge.core.Chat
 import dev.neuroforge.core.ChatKind
 import dev.neuroforge.core.ChatMessage
@@ -55,6 +72,8 @@ import dev.neuroforge.core.OutputTarget
 import dev.neuroforge.core.Speaker
 import dev.neuroforge.core.StopReason
 import dev.neuroforge.core.UpscaleStrategy
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 
 /**
  * Conversations, one per kind of thing you can generate.
@@ -264,11 +283,30 @@ private fun ChatThread(vm: AppViewModel, state: UiState, chat: Chat) {
       }
     }
 
+    if (chat.kind == ChatKind.TEXT && state.pending.isNotEmpty()) {
+      PendingAttachments(state.pending, onRemove = vm::detach)
+    }
+
     Row(
       Modifier.fillMaxWidth().padding(12.dp),
       horizontalArrangement = Arrangement.spacedBy(8.dp),
       verticalAlignment = Alignment.CenterVertically,
     ) {
+      if (chat.kind == ChatKind.TEXT) {
+        // Any MIME type, because the picker's type filter cannot express "text-ish": most
+        // source files come back as octet-stream, and filtering on text/* would hide the
+        // files this is most wanted for. What can actually be used is decided on the way
+        // in, where the refusal can name the file.
+        val picker = rememberLauncherForActivityResult(
+          ActivityResultContracts.OpenDocument(),
+        ) { uri -> uri?.let(vm::attach) }
+        IconButton(
+          onClick = { picker.launch(arrayOf("*/*")) },
+          enabled = !state.replying,
+        ) {
+          Icon(Icons.Default.AttachFile, contentDescription = "Attach a file or photo")
+        }
+      }
       OutlinedTextField(
         value = draft,
         onValueChange = { draft = it },
@@ -280,7 +318,7 @@ private fun ChatThread(vm: AppViewModel, state: UiState, chat: Chat) {
       )
       Button(
         onClick = { vm.send(draft); draft = "" },
-        enabled = !state.replying && draft.isNotBlank(),
+        enabled = !state.replying && (draft.isNotBlank() || state.pending.isNotEmpty()),
       ) { Text("Send") }
     }
   }
@@ -396,6 +434,12 @@ private fun Bubble(message: ChatMessage) {
           )
         }
 
+        // A text attachment is folded into the prompt, so the text above is the question
+        // alone and nothing in the bubble would otherwise say which file it was about.
+        if (message.attachments.isNotEmpty()) {
+          SentAttachments(message.attachments)
+        }
+
         // Which accelerator answered, what it cost, and why it stopped. Bound to a local
         // because a property from another module cannot be smart-cast after a null check.
         val stats = message.stats
@@ -482,3 +526,113 @@ private fun ThinkingPanel(thinking: String) {
     }
   }
 }
+
+/**
+ * What is staged for the next message, with a way to take it back.
+ *
+ * Shown above the input rather than inside it because a photo attached by mistake should
+ * be obvious before Send, not after: an image costs a few hundred tokens of context and,
+ * on a model that cannot see, the whole turn.
+ */
+@Composable
+private fun PendingAttachments(
+  pending: List<Attachment>,
+  onRemove: (Attachment) -> Unit,
+) {
+  Row(
+    Modifier
+      .fillMaxWidth()
+      .horizontalScroll(rememberScrollState())
+      .padding(horizontal = 12.dp),
+    horizontalArrangement = Arrangement.spacedBy(6.dp),
+  ) {
+    pending.forEach { attachment ->
+      AssistChip(
+        onClick = { onRemove(attachment) },
+        label = { Text(attachment.fileName, maxLines = 1) },
+        leadingIcon = { AttachmentIcon(attachment) },
+        trailingIcon = {
+          Icon(
+            Icons.Default.Close,
+            contentDescription = "Remove ${attachment.fileName}",
+            modifier = Modifier.size(16.dp),
+          )
+        },
+      )
+    }
+  }
+}
+
+/** The files a turn was sent with, under the bubble. */
+@Composable
+private fun SentAttachments(attachments: List<Attachment>) {
+  Column(Modifier.padding(top = 6.dp)) {
+    attachments.forEach { attachment ->
+      Row(
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(6.dp),
+      ) {
+        AttachmentIcon(attachment)
+        Text(
+          attachment.fileName,
+          style = MaterialTheme.typography.labelSmall,
+          color = MaterialTheme.colorScheme.onSurfaceVariant,
+          maxLines = 1,
+        )
+      }
+      // A photo is worth showing; a text file was folded into the prompt and its name is
+      // all there is to see.
+      if (attachment.kind == AttachmentKind.IMAGE) {
+        AsyncAttachmentImage(attachment)
+      }
+    }
+  }
+}
+
+@Composable
+private fun AttachmentIcon(attachment: Attachment) {
+  Icon(
+    if (attachment.kind == AttachmentKind.IMAGE) Icons.Default.Photo else Icons.Default.Description,
+    contentDescription = null,
+    modifier = Modifier.size(16.dp),
+  )
+}
+
+/**
+ * A thumbnail of an attached photo.
+ *
+ * Decoded at a bounded size with `inSampleSize` rather than loaded whole: a modern phone
+ * camera produces a 12-megapixel JPEG, which is 48 MB as an ARGB bitmap and enough to
+ * push a chat with a few photos in it straight into an OutOfMemoryError.
+ */
+@Composable
+private fun AsyncAttachmentImage(attachment: Attachment) {
+  val bitmap by produceState<android.graphics.Bitmap?>(null, attachment.localPath) {
+    value = withContext(Dispatchers.IO) {
+      runCatching {
+        val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        BitmapFactory.decodeFile(attachment.localPath, bounds)
+        var sample = 1
+        while (bounds.outWidth / sample > THUMBNAIL_PX || bounds.outHeight / sample > THUMBNAIL_PX) {
+          sample *= 2
+        }
+        BitmapFactory.decodeFile(
+          attachment.localPath,
+          BitmapFactory.Options().apply { inSampleSize = sample },
+        )
+      }.getOrNull()
+    }
+  }
+  bitmap?.let {
+    Image(
+      bitmap = it.asImageBitmap(),
+      contentDescription = attachment.fileName,
+      modifier = Modifier
+        .padding(top = 4.dp)
+        .heightIn(max = 180.dp)
+        .clip(RoundedCornerShape(8.dp)),
+    )
+  }
+}
+
+private const val THUMBNAIL_PX = 512

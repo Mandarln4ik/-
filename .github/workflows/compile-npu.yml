@@ -1,0 +1,73 @@
+name: Compile for NPU
+
+# The AOT compiler is x86_64-only (docs/NPU_COMPILATION.md says why, and that the limit is
+# Google's packaging rather than MediaTek's compiler). A GitHub runner is an x86_64 Linux
+# machine, so the compile can happen here instead of on a desktop nobody has: fill in the
+# model and the SoC, and the compiled graph comes back as a downloadable artifact.
+on:
+  workflow_dispatch:
+    inputs:
+      source:
+        description: "Hugging Face repo id, or a direct https URL to a .tflite"
+        required: true
+        default: "litert-community/Gemma3-1B-IT"
+      path:
+        description: "File inside the repo (leave blank for a direct URL)"
+        required: false
+        default: ""
+      soc:
+        description: "Target SoC, as the Device tab reports Build.SOC_MODEL"
+        required: true
+        default: "MT6991"
+
+permissions:
+  contents: read
+
+jobs:
+  compile:
+    name: AOT compile
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # ai-edge-litert carries the compiler plugins; the mediatek sdk package fetches
+      # NeuroPilot, without which the plugin recognises the chip and then fails on
+      # "Failed to load NeuronAdapter shared library" — which reads like a broken install.
+      - name: Install the AOT toolchain
+        run: |
+          set -euo pipefail
+          python3 -m pip install --quiet --upgrade pip
+          python3 -m pip install --quiet ai-edge-litert ai-edge-litert-sdk-mediatek
+          python3 -c "import ai_edge_litert; print('ai-edge-litert', ai_edge_litert.__version__)"
+
+      - name: Fetch the model
+        env:
+          SOURCE: ${{ github.event.inputs.source }}
+          MODEL_PATH: ${{ github.event.inputs.path }}
+        run: |
+          set -euo pipefail
+          mkdir -p work
+          if [ "${SOURCE#https://}" != "${SOURCE}" ]; then
+            curl -sSLf -o work/model.tflite "${SOURCE}"
+          else
+            test -n "${MODEL_PATH}" || { echo "a repo id needs a file path too"; exit 1; }
+            curl -sSLf -o work/model.tflite \
+              "https://huggingface.co/${SOURCE}/resolve/main/${MODEL_PATH}?download=true"
+          fi
+          ls -lh work/model.tflite
+
+      - name: Compile
+        env:
+          SOC: ${{ github.event.inputs.soc }}
+        run: python3 tools/npu/compile_for_npu.py work/model.tflite --soc "${SOC}" --out work/npu
+
+      - name: Publish the result
+        uses: actions/upload-artifact@v4
+        with:
+          name: npu-${{ github.event.inputs.soc }}
+          path: work/npu
+          if-no-files-found: error

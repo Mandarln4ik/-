@@ -61,7 +61,11 @@ class ExecuTorchEngine private constructor(
    * clears it. So "new conversation" is that reset, and the system prompt is remembered
    * here to be prepended to the first turn.
    */
-  override suspend fun startConversation(systemPrompt: String, sampling: SamplingOptions) {
+  override suspend fun startConversation(
+    systemPrompt: String,
+    sampling: SamplingOptions,
+    tools: Set<String>,
+  ) {
     withContext(Dispatchers.IO) {
       this@ExecuTorchEngine.systemPrompt = systemPrompt
       runCatching { module.resetContext() }
@@ -69,7 +73,19 @@ class ExecuTorchEngine private constructor(
     }
   }
 
-  override fun send(prompt: String): Flow<String> = callbackFlow {
+  /**
+   * Text only.
+   *
+   * ExecuTorch does have a vision model type, but it needs a .pte exported with a vision tower and a different call sequence (prefillImages before the prompt); nothing in the catalogue is such an export yet, so claiming it here would be untested.
+   *
+   * Refusing a non-empty [imagePaths] rather than ignoring it: a dropped attachment makes
+   * the model answer about a photo it never saw, and nothing in the reply says so.
+   */
+  override fun send(prompt: String, imagePaths: List<String>): Flow<String> = callbackFlow {
+    check(imagePaths.isEmpty()) {
+      "ExecuTorch cannot be shown an image. Switch to a LiteRT-LM model that the Models tab " +
+        "marks as able to see, or send the message without the photo."
+    }
     val text = if (systemPrompt.isBlank()) prompt else "$systemPrompt\n\n$prompt"
     // Only the first turn carries the system prompt; after that the module's own cache has
     // it, and repeating it would spend context on a duplicate every turn.

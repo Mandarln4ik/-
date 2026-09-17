@@ -12,6 +12,7 @@ import com.google.ai.edge.litertlm.Engine
 import com.google.ai.edge.litertlm.EngineConfig
 import com.google.ai.edge.litertlm.Message
 import com.google.ai.edge.litertlm.SamplerConfig
+import com.google.ai.edge.litertlm.tool
 import dev.neuroforge.core.Accel
 import dev.neuroforge.core.AcceleratorPolicy
 import dev.neuroforge.core.TextBackend
@@ -40,6 +41,7 @@ class LiteRtLmEngine private constructor(
   override val contextTokens: Int,
   override val loadMillis: Long,
   override val attempts: List<String>,
+  override val supportsImages: Boolean,
   private val engine: Engine,
 ) : TextEngine {
 
@@ -53,14 +55,23 @@ class LiteRtLmEngine private constructor(
    * The engine holds conversation state, so this is what "new chat" actually means; the
    * message list in the UI is a record of it, not the state itself.
    */
+  override val supportsTools: Boolean get() = true
+
   override suspend fun startConversation(
     systemPrompt: String,
     sampling: SamplingOptions,
+    tools: Set<String>,
   ): Unit = withContext(Dispatchers.IO) {
     closeConversation()
     conversation = engine.createConversation(
       ConversationConfig(
         systemInstruction = Contents.of(systemPrompt),
+        // Real function calling, not a prompt convention: with automatic tool calling on,
+        // the runtime invokes these itself when the model asks and folds the result back
+        // into the same turn. A model that was not trained to emit tool calls simply never
+        // does, which costs nothing but the description in its context.
+        tools = DeviceTools.bind(tools, accelerator).map { tool(it) },
+        automaticToolCalling = true,
         samplerConfig = SamplerConfig(
           temperature = sampling.temperature,
           topK = sampling.topK,
@@ -78,9 +89,21 @@ class LiteRtLmEngine private constructor(
    * subtly worse rendering — it puts the data class's own debug representation into the
    * conversation instead of the model's words.
    */
-  override fun send(prompt: String): Flow<String> {
+  override fun send(prompt: String, imagePaths: List<String>): Flow<String> {
     val conv = conversation ?: error("No conversation started")
-    return conv.sendMessageAsync(prompt).map { it.text() }
+    if (imagePaths.isEmpty()) {
+      return conv.sendMessageAsync(prompt).map { it.text() }
+    }
+    check(supportsImages) {
+      "This model has no vision executor, so it cannot be shown an image. Pick a model " +
+        "the Models tab marks as able to see, or send the message without the photo."
+    }
+    // The image goes first: every multimodal template this runtime supports expects the
+    // picture before the question about it, and the reference sample orders it that way.
+    val contents = Contents.of(
+      imagePaths.map { Content.ImageFile(it) } + Content.Text(prompt),
+    )
+    return conv.sendMessageAsync(contents).map { it.text() }
   }
 
   private fun Message.text(): String =
@@ -105,6 +128,15 @@ class LiteRtLmEngine private constructor(
     private const val TAG = "LiteRtLmEngine"
 
     /**
+     * Images the engine will accept in one turn.
+     *
+     * Each one costs a few hundred tokens of context after the vision tower encodes it, so
+     * a handful is already most of a small window. Four is enough to compare things and
+     * small enough that the reply still has room.
+     */
+    private const val MAX_IMAGES_PER_TURN = 4
+
+    /**
      * Loads [modelFile], trying the backends [policy] allows in order.
      *
      * [onProgress] reports a stage and an elapsed time, not a percentage: `initialize()` is
@@ -122,6 +154,7 @@ class LiteRtLmEngine private constructor(
       modelFile: File,
       policy: AcceleratorPolicy = AcceleratorPolicy.AUTO,
       contextTokens: Int = 2048,
+      vision: Boolean = false,
       onProgress: (LlmLoadProgress) -> Unit = {},
     ): LiteRtLmEngine = withContext(Dispatchers.IO) {
       require(modelFile.isFile) { "model file missing: ${modelFile.absolutePath}" }
@@ -133,41 +166,64 @@ class LiteRtLmEngine private constructor(
       if (Accel.NPU in targets) configureNativeRuntime(libDir)
 
       val failures = mutableListOf<String>()
-      for (accel in targets) {
-        onProgress(LlmLoadProgress("Loading on $accel", elapsed(), failures.toList()))
-        val backend = when (accel) {
-          Accel.NPU -> Backend.NPU(nativeLibraryDir = libDir)
-          Accel.GPU -> Backend.GPU()
-          Accel.CPU -> Backend.CPU()
-        }
-        val attempt = runCatching {
-          val created = Engine(
-            EngineConfig(
-              modelPath = modelFile.absolutePath,
-              backend = backend,
-              maxNumTokens = contextTokens,
-              // Required for just-in-time compilation; without it the NPU backend has
-              // nowhere to put the graph it builds and fails on every load.
-              cacheDir = context.cacheDir.path,
+
+      // Vision first, then the same accelerators again without it.
+      //
+      // A vision executor is a separate thing from the text one and can fail on its own —
+      // the tower may want a backend this chip's driver will not give it. Falling back to
+      // text-only is much better than failing the load, because the model still answers
+      // questions; what must not happen is the app going on to believe it can see. That is
+      // why the second pass is a distinct attempt rather than a retry, and why the engine
+      // carries whether vision actually came up rather than whether it was asked for.
+      val passes = if (vision) listOf(true, false) else listOf(false)
+
+      for (withVision in passes) {
+        for (accel in targets) {
+          val label = if (withVision) "$accel with vision" else "$accel"
+          onProgress(LlmLoadProgress("Loading on $label", elapsed(), failures.toList()))
+          val backend = when (accel) {
+            Accel.NPU -> Backend.NPU(nativeLibraryDir = libDir)
+            Accel.GPU -> Backend.GPU()
+            Accel.CPU -> Backend.CPU()
+          }
+          val attempt = runCatching {
+            val created = Engine(
+              EngineConfig(
+                modelPath = modelFile.absolutePath,
+                backend = backend,
+                // Upstream's guidance is to match the vision executor to the text backend
+                // and let the cascade handle the combinations that do not start.
+                visionBackend = if (withVision) backend else null,
+                maxNumTokens = contextTokens,
+                maxNumImages = if (withVision) MAX_IMAGES_PER_TURN else null,
+                // Required for just-in-time compilation; without it the NPU backend has
+                // nowhere to put the graph it builds and fails on every load.
+                cacheDir = context.cacheDir.path,
+              )
             )
+            created.initialize()
+            created
+          }
+          attempt.fold(
+            onSuccess = {
+              Log.i(TAG, "${modelFile.name} -> $label in ${elapsed()} ms")
+              if (vision && !withVision) {
+                failures += "Loaded without vision: the text model works, but this build " +
+                  "of the runtime would not start a vision executor on this device, so " +
+                  "photos cannot be sent to it."
+              }
+              onProgress(LlmLoadProgress("Ready on $label", elapsed(), failures.toList()))
+              return@withContext LiteRtLmEngine(
+                accel, contextTokens, elapsed(), failures.toList(), withVision, it,
+              )
+            },
+            onFailure = { e ->
+              val explained = explainLlmFailure(accel, e.message)
+              failures += if (withVision) "$explained (with vision)" else explained
+              Log.w(TAG, "${modelFile.name} rejected by $label: $explained", e)
+            },
           )
-          created.initialize()
-          created
         }
-        attempt.fold(
-          onSuccess = {
-            Log.i(TAG, "${modelFile.name} -> $accel in ${elapsed()} ms")
-            onProgress(LlmLoadProgress("Ready on $accel", elapsed(), failures.toList()))
-            return@withContext LiteRtLmEngine(
-              accel, contextTokens, elapsed(), failures.toList(), it,
-            )
-          },
-          onFailure = { e ->
-            val explained = explainLlmFailure(accel, e.message)
-            failures += explained
-            Log.w(TAG, "${modelFile.name} rejected by $accel: $explained", e)
-          },
-        )
       }
       error(
         "No backend loaded ${modelFile.name} after ${elapsed()} ms.\n" +

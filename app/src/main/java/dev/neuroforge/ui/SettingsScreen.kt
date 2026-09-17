@@ -8,22 +8,29 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.material3.Button
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.RadioButton
 import androidx.compose.material3.Slider
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Row
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import dev.neuroforge.core.Accel
 import dev.neuroforge.core.AcceleratorPolicy
+import dev.neuroforge.core.AiTools
 import dev.neuroforge.core.ModelCatalog
 import dev.neuroforge.core.TextBackend
+import dev.neuroforge.core.estimateTokens
 
 /**
  * Where the accelerator choice lives.
@@ -42,6 +49,8 @@ fun SettingsScreen(vm: AppViewModel, state: UiState) {
   val temperature by vm.temperature.collectAsStateWithLifecycle()
   val topK by vm.topK.collectAsStateWithLifecycle()
   val topP by vm.topP.collectAsStateWithLifecycle()
+  val instruction by vm.instruction.collectAsStateWithLifecycle()
+  val enabledTools by vm.enabledTools.collectAsStateWithLifecycle()
 
   LazyColumn(Modifier.fillMaxSize()) {
     item {
@@ -112,6 +121,92 @@ fun SettingsScreen(vm: AppViewModel, state: UiState) {
             "rather than a ranking. ExecuTorch has a MediaTek backend, but it is compiled " +
             "in when the runtime is built and the public one carries XNNPACK alone. " +
             "llama.cpp has no MediaTek path at all.",
+          style = MaterialTheme.typography.labelSmall,
+          color = MaterialTheme.colorScheme.onSurfaceVariant,
+          modifier = Modifier.padding(top = 12.dp),
+        )
+      }
+    }
+
+    item {
+      SectionCard("Instruction") {
+        Text(
+          "What the model is told before your first message. Applies to the next " +
+            "conversation — the engine holds one at a time, so switching chats or " +
+            "pressing Apply below is what puts a change into effect.",
+          style = MaterialTheme.typography.bodySmall,
+          color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        var draft by remember(instruction) { mutableStateOf(instruction) }
+        OutlinedTextField(
+          value = draft,
+          onValueChange = { draft = it },
+          modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
+          minLines = 3,
+          maxLines = 10,
+          label = { Text("System instruction") },
+        )
+        Text(
+          "≈${estimateTokens(draft)} tokens, taken off the context window every " +
+            "conversation.",
+          style = MaterialTheme.typography.labelSmall,
+          color = MaterialTheme.colorScheme.onSurfaceVariant,
+          modifier = Modifier.padding(top = 4.dp),
+        )
+        Row(
+          Modifier.padding(top = 8.dp),
+          horizontalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+          Button(
+            onClick = { vm.setInstruction(draft); vm.reloadEngine() },
+            enabled = draft != instruction,
+          ) { Text("Apply") }
+          OutlinedButton(
+            onClick = { draft = UiState.SYSTEM_PROMPT },
+            enabled = draft != UiState.SYSTEM_PROMPT,
+          ) { Text("Reset") }
+        }
+      }
+    }
+
+    item {
+      SectionCard("Tools") {
+        Text(
+          "Functions the model can call mid-answer. The runtime runs them and feeds the " +
+            "result back into the same reply, so this is real function calling rather " +
+            "than a prompt convention.",
+          style = MaterialTheme.typography.bodySmall,
+          color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        AiTools.all.forEach { tool ->
+          Row(
+            Modifier.fillMaxWidth().padding(top = 10.dp),
+            verticalAlignment = Alignment.Top,
+          ) {
+            Switch(
+              checked = tool.name in enabledTools,
+              onCheckedChange = { vm.setToolEnabled(tool.name, it) },
+            )
+            Column(Modifier.padding(start = 8.dp)) {
+              Text(tool.name, style = MaterialTheme.typography.bodyMedium)
+              Text(
+                tool.description,
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+              )
+            }
+          }
+        }
+        Text(
+          if (backend.supportsTools) {
+            "Two things have to be true for a tool to fire: the runtime has to support " +
+              "calling one — only LiteRT-LM here does — and the model has to have been " +
+              "trained to ask. A model that was not simply never calls anything, and the " +
+              "descriptions cost it a little context for nothing."
+          } else {
+            "${backend.label} cannot call tools at all, so these are not offered to it. " +
+              "Switch the text backend to LiteRT-LM to use them."
+          },
           style = MaterialTheme.typography.labelSmall,
           color = MaterialTheme.colorScheme.onSurfaceVariant,
           modifier = Modifier.padding(top = 12.dp),

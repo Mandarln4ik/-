@@ -2,6 +2,7 @@ package dev.neuroforge.ui
 
 import android.app.Application
 import android.graphics.Bitmap
+import android.net.Uri
 import android.os.SystemClock
 import android.util.Log
 import androidx.lifecycle.ViewModel
@@ -22,7 +23,12 @@ import dev.neuroforge.core.ContextBudget
 import dev.neuroforge.core.ReplyStats
 import dev.neuroforge.core.StopReason
 import dev.neuroforge.core.TextBackend
+import dev.neuroforge.core.AiTools
+import dev.neuroforge.core.Attachment
+import dev.neuroforge.core.AttachmentKind
+import dev.neuroforge.core.attachmentTokenBudget
 import dev.neuroforge.core.backendFor
+import dev.neuroforge.core.foldTextAttachments
 import dev.neuroforge.core.contextUsed
 import dev.neuroforge.core.estimateTokens
 import dev.neuroforge.core.mostRecentFirst
@@ -35,6 +41,7 @@ import dev.neuroforge.core.ModelSpec
 import dev.neuroforge.core.OutputTarget
 import dev.neuroforge.core.RenderPlan
 import dev.neuroforge.core.UpscaleStrategy
+import dev.neuroforge.models.AttachmentStore
 import dev.neuroforge.models.DownloadProgress
 import dev.neuroforge.models.ChatStore
 import dev.neuroforge.models.HfBrowser
@@ -82,6 +89,19 @@ data class UiState(
   /** Context window the loaded engine opened, for the gauge above the input. */
   val llmContextTokens: Int = 0,
 
+  /** Whether the loaded engine can actually be shown an image. */
+  val llmSupportsImages: Boolean = false,
+
+  /** Files picked for the message not yet sent. Cleared when it is. */
+  val pending: List<Attachment> = emptyList(),
+
+  /**
+   * The system instruction in force, mirrored here so the context gauge measures what is
+   * actually being sent. An edited instruction can be several hundred tokens, and a gauge
+   * that silently assumed the built-in one would under-report by exactly that much.
+   */
+  val instruction: String = SYSTEM_PROMPT,
+
   val browseRepo: String = "",
   val browseFiles: List<RepoFile> = emptyList(),
   val browsing: Boolean = false,
@@ -105,7 +125,7 @@ data class UiState(
       val chat = activeChat ?: return null
       if (chat.kind != ChatKind.TEXT || llmContextTokens <= 0) return null
       val parts = chat.messages.flatMap { listOfNotNull(it.text, it.thinking) }
-      return ContextBudget(contextUsed(SYSTEM_PROMPT, parts), llmContextTokens)
+      return ContextBudget(contextUsed(instruction, parts), llmContextTokens)
     }
 
   companion object {
@@ -158,6 +178,29 @@ class AppViewModel(private val app: NeuroForgeApp) : ViewModel() {
   val topP = MutableStateFlow(prefs().getFloat(KEY_TOP_P, 0.9f).toDouble())
 
   /**
+   * The system instruction, editable.
+   *
+   * One instruction for the app rather than one per chat: a per-chat override sounds
+   * better than it is, because the engine holds a single conversation and switching chats
+   * already rebuilds it. Changing this takes effect on the next conversation, which is
+   * what the Settings screen says.
+   */
+  val instruction = MutableStateFlow(
+    prefs().getString(KEY_INSTRUCTION, null) ?: UiState.SYSTEM_PROMPT
+  )
+
+  /** Tool names the model may call. Stored as a comma-separated list of names. */
+  val enabledTools = MutableStateFlow(
+    prefs().getString(KEY_TOOLS, null)
+      ?.split(',')?.filter { it.isNotBlank() }?.toSet()
+      // A name that no longer exists is dropped rather than carried: tools come and go
+      // between versions and a stale one would be offered to the model as a function the
+      // app cannot run.
+      ?.filter { AiTools.byName(it) != null }?.toSet()
+      ?: AiTools.all.filter { it.enabledByDefault }.map { it.name }.toSet()
+  )
+
+  /**
    * Hugging Face access token, for gated and private repositories.
    *
    * Kept in the same preferences file as everything else, which is app-private storage.
@@ -183,11 +226,15 @@ class AppViewModel(private val app: NeuroForgeApp) : ViewModel() {
    * runs early. So anything an `init` path can touch belongs here, above it.
    */
   private val chatStore by lazy { ChatStore(app) }
+  private val attachments by lazy { AttachmentStore(app) }
 
   /** Reads the token through a supplier rather than copying it, so a later paste reaches it. */
   private val browser by lazy { HfBrowser { hfToken.value.takeIf { t -> t.isNotBlank() } } }
 
   init {
+    // The stored instruction has to reach the state, or the context gauge measures the
+    // built-in one on every launch until the user happens to edit it.
+    _state.update { it.copy(instruction = instruction.value) }
     applyToken(hfToken.value)
     refreshDevice()
     refreshModels()
@@ -473,20 +520,57 @@ class AppViewModel(private val app: NeuroForgeApp) : ViewModel() {
         activeChatId = if (s.activeChatId == id) null else s.activeChatId,
       )
     }
+    // The copies belong to the conversation; leaving them behind would quietly accumulate
+    // every photo ever attached to a chat the user thought they had deleted.
+    viewModelScope.launch { attachments.forget(id) }
     persistChats()
+  }
+
+  /**
+   * Copies a picked file in and stages it for the next message.
+   *
+   * The refusal happens here, while the file is still the thing the user is looking at.
+   * Discovering that a PDF cannot be sent after typing a question about it is a worse
+   * experience than being told at the moment of picking.
+   */
+  fun attach(uri: Uri) {
+    val chat = _state.value.activeChat ?: return
+    viewModelScope.launch {
+      runCatching { attachments.store(chat.id, uri) }.fold(
+        onSuccess = { added -> _state.update { it.copy(pending = it.pending + added) } },
+        onFailure = { e ->
+          _state.update { it.copy(error = e.message ?: "That file could not be attached.") }
+        },
+      )
+    }
+  }
+
+  /** Removes a staged file and deletes the copy, since the message was never sent. */
+  fun detach(attachment: Attachment) {
+    _state.update { it.copy(pending = it.pending.filterNot { a -> a.id == attachment.id }) }
+    viewModelScope.launch { attachments.discard(attachment) }
   }
 
   fun send(text: String) {
     val chat = _state.value.activeChat ?: return
-    if (text.isBlank() || _state.value.replying) return
+    val staged = _state.value.pending
+    if ((text.isBlank() && staged.isEmpty()) || _state.value.replying) return
 
-    appendMessage(chat.id, ChatMessage(Speaker.USER, text, timestamp = System.currentTimeMillis()))
+    appendMessage(
+      chat.id,
+      ChatMessage(
+        Speaker.USER, text,
+        timestamp = System.currentTimeMillis(),
+        attachments = staged,
+      ),
+    )
+    _state.update { it.copy(pending = emptyList()) }
 
     replyJob = viewModelScope.launch {
       _state.update { it.copy(replying = true, error = null) }
       try {
         when (chat.kind) {
-          ChatKind.TEXT -> replyWithText(chat, text)
+          ChatKind.TEXT -> replyWithText(chat, text, staged)
           ChatKind.IMAGE -> replyWithImage(chat, text)
           ChatKind.MUSIC -> error(
             ChatKind.MUSIC.unsupportedReason ?: "Music generation is not available."
@@ -501,7 +585,11 @@ class AppViewModel(private val app: NeuroForgeApp) : ViewModel() {
     }
   }
 
-  private suspend fun replyWithText(chat: Chat, prompt: String) {
+  private suspend fun replyWithText(
+    chat: Chat,
+    prompt: String,
+    attached: List<Attachment> = emptyList(),
+  ) {
     val spec = ModelCatalog.byId(chat.modelId) ?: error("Model ${chat.modelId} is gone")
     val file = app.repository.fileFor(spec, spec.files.first())
 
@@ -522,18 +610,55 @@ class AppViewModel(private val app: NeuroForgeApp) : ViewModel() {
           tokenizerFile = spec.files
             .firstOrNull { it.fileName.endsWith(".json") || it.fileName.endsWith(".model") }
             ?.let { app.repository.fileFor(spec, it) },
+          vision = spec.vision,
         ) { progress -> _state.update { it.copy(llmLoad = progress) } }
       } finally {
         _state.update { it.copy(llmLoad = null) }
       }
       loadedLlmModelId = chat.modelId
       llm?.startConversation(
-        UiState.SYSTEM_PROMPT,
+        instruction.value,
         SamplingOptions(temperature.value, topK.value, topP.value),
+        enabledTools.value,
       )
     }
     val engine = llm ?: error("Text engine unavailable")
-    _state.update { it.copy(llmContextTokens = engine.contextTokens) }
+    _state.update {
+      it.copy(
+        llmContextTokens = engine.contextTokens,
+        llmSupportsImages = engine.supportsImages,
+      )
+    }
+
+    val images = attached.filter { it.kind == AttachmentKind.IMAGE }
+    require(images.isEmpty() || engine.supportsImages) {
+      "${spec.displayName} cannot be shown an image — it has no vision tower, or the " +
+        "runtime would not start one on this device. Pick a model marked as able to see, " +
+        "or remove the photo."
+    }
+
+    // Text files have nowhere to go but the prompt, so they compete with the conversation
+    // for the window. The budget is computed from what the conversation already holds
+    // rather than from the window alone.
+    // Read on IO first, then fold: the folding is pure so that it can be unit-tested off
+    // the device, which means it cannot suspend to read a file itself.
+    val texts = attached
+      .filter { it.kind == AttachmentKind.TEXT }
+      .associate { it.id to runCatching { attachments.readText(it) } }
+    val used = contextUsed(instruction.value, chat.messages.map { it.text } + prompt)
+    val folded = foldTextAttachments(
+      prompt = prompt,
+      attachments = attached,
+      tokenBudget = attachmentTokenBudget(engine.contextTokens, used),
+    ) { file -> texts.getValue(file.id).getOrThrow() }
+    if (folded.wasTruncated) {
+      _state.update {
+        it.copy(
+          error = "Only part of ${folded.dropped.joinToString(", ")} fitted in the " +
+            "context window. The reply is about what fitted.",
+        )
+      }
+    }
 
     val sent = SystemClock.elapsedRealtime()
     var firstToken = 0L
@@ -551,7 +676,7 @@ class AppViewModel(private val app: NeuroForgeApp) : ViewModel() {
     )
 
     try {
-      engine.send(prompt).collect { chunk ->
+      engine.send(folded.text, images.map { it.localPath }).collect { chunk ->
         if (chunk.isEmpty()) return@collect
         // The first token is when prefill - and on an NPU any just-in-time compilation -
         // has finished. It is usually most of a short reply's wall clock, so it is timed
@@ -735,6 +860,20 @@ class AppViewModel(private val app: NeuroForgeApp) : ViewModel() {
     prefs().edit().putFloat(KEY_TOP_P, clamped.toFloat()).apply()
   }
 
+  /** Replaces the system instruction. Blank restores the built-in one. */
+  fun setInstruction(next: String) {
+    val cleaned = next.trim().ifBlank { UiState.SYSTEM_PROMPT }
+    instruction.value = cleaned
+    _state.update { it.copy(instruction = cleaned) }
+    prefs().edit().putString(KEY_INSTRUCTION, cleaned).apply()
+  }
+
+  fun setToolEnabled(name: String, enabled: Boolean) {
+    val next = if (enabled) enabledTools.value + name else enabledTools.value - name
+    enabledTools.value = next
+    prefs().edit().putString(KEY_TOOLS, next.joinToString(",")).apply()
+  }
+
   fun setTextBackend(next: TextBackend) {
     textBackend.value = next
     prefs().edit().putString(KEY_BACKEND, next.name).apply()
@@ -795,6 +934,8 @@ class AppViewModel(private val app: NeuroForgeApp) : ViewModel() {
     private const val KEY_TEMPERATURE = "temperature"
     private const val KEY_TOP_K = "top_k"
     private const val KEY_TOP_P = "top_p"
+    private const val KEY_INSTRUCTION = "system_instruction"
+    private const val KEY_TOOLS = "enabled_tools"
     private const val TAG = "AppViewModel"
 
     /** Job key for the whole-pipeline download; not a model id, so it cannot collide. */

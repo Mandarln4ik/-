@@ -74,7 +74,11 @@ class LlamaCppEngine private constructor(
   /** Exactly the text that has been decoded into the KV cache. */
   private var fed = ""
 
-  override suspend fun startConversation(systemPrompt: String, sampling: SamplingOptions) {
+  override suspend fun startConversation(
+    systemPrompt: String,
+    sampling: SamplingOptions,
+    tools: Set<String>,
+  ) {
     withContext(Dispatchers.IO) {
       this@LlamaCppEngine.sampling = sampling
       LlamaCppNative.clearMemory(context)
@@ -88,7 +92,19 @@ class LlamaCppEngine private constructor(
     }
   }
 
-  override fun send(prompt: String): Flow<String> = callbackFlow {
+  /**
+   * Text only.
+   *
+   * llama.cpp's multimodal support lives in libmtmd, which is under tools/ and excluded from this build. Adding it means a second projector model per chat model, so it is a deliberate omission rather than an oversight.
+   *
+   * Refusing a non-empty [imagePaths] rather than ignoring it: a dropped attachment makes
+   * the model answer about a photo it never saw, and nothing in the reply says so.
+   */
+  override fun send(prompt: String, imagePaths: List<String>): Flow<String> = callbackFlow {
+    check(imagePaths.isEmpty()) {
+      "llama.cpp cannot be shown an image. Switch to a LiteRT-LM model that the Models tab " +
+        "marks as able to see, or send the message without the photo."
+    }
     roles += "user"
     contents += prompt
 
