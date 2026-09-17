@@ -75,7 +75,19 @@ FetchContent_MakeAvailable(llama)
 # typo, or an upstream rename of this variable -- the quantised kernels would fall back to
 # the armv8-a baseline and the only symptom would be decoding several times slower than it
 # should. So read it back off the target instead of reading the log.
-if (ANDROID AND TARGET ggml-cpu)
+#
+# Structured so that there is no way for it to pass by doing nothing. An earlier version
+# wrote `if (ANDROID AND TARGET ggml-cpu)`, which skips silently if the target is ever
+# renamed upstream -- and the Gradle build filters CMake's STATUS output, so the reassuring
+# message would not have been visible either way. A check whose failure mode is silence is
+# not a check. On Android this now either confirms the flag or stops the build.
+if (CMAKE_SYSTEM_NAME STREQUAL "Android")
+    if (NOT TARGET ggml-cpu)
+        message(FATAL_ERROR
+            "llama.cpp built no ggml-cpu target, so -march=${GGML_CPU_ARM_ARCH} cannot be "
+            "confirmed to have reached the quantised kernels. Upstream has probably renamed "
+            "it; find the new name before trusting this build.")
+    endif()
     get_target_property(ggml_cpu_options ggml-cpu COMPILE_OPTIONS)
     string(FIND "${ggml_cpu_options}" "-march=${GGML_CPU_ARM_ARCH}" march_position)
     if (march_position EQUAL -1)
@@ -96,6 +108,6 @@ target_link_libraries(llama_jni PRIVATE llama)
 # src/test/native builds this same file for the host, where there is no such library --
 # that host build is what runs the JNI layer against a real model, so keeping it possible
 # is worth one conditional.
-if (ANDROID)
+if (CMAKE_SYSTEM_NAME STREQUAL "Android")
     target_link_libraries(llama_jni PRIVATE log)
 endif()

@@ -551,7 +551,7 @@ object ModelCatalog {
         fileName = "llama32_1b_spinquant.pte",
         source = ModelSource.HuggingFace(
           repoId = "executorch-community/Llama-3.2-1B-Instruct-SpinQuant_INT4_EO8-ET",
-          path = "llama3_2-1B-Instruct-SpinQuant_INT4_EO8.pte",
+          path = "Llama-3.2-1B-Instruct-SpinQuant_INT4_EO8.pte",
           hints = listOf("spinquant", "int4", "1b"),
         ),
         sizeBytes = 0L,
@@ -573,10 +573,15 @@ object ModelCatalog {
   /**
    * SmolLM2 135M as an ExecuTorch `.pte`.
    *
-   * The smallest thing in the catalogue by an order of magnitude, and here as a "does this
-   * backend work at all" model rather than as a useful assistant — at 135M parameters the
-   * answers show it. Worth the entry because it downloads in seconds, so a backend that
-   * cannot open a file says so immediately instead of after a gigabyte.
+   * The smallest thing in the catalogue by an order of magnitude in parameters, and here as
+   * a "does this backend work at all" model rather than as a useful assistant — at 135M the
+   * answers show it.
+   *
+   * Not, however, a small download: this export is float, so 135M parameters come to 518
+   * MiB — larger than the 469 MiB Qwen 0.5B GGUF, which has four times the parameters at
+   * four bits each. What it is, is fast: eight times fewer parameters than the SpinQuant
+   * Llama above and half the bytes to fetch, which is the reason to reach for it when the
+   * question is whether ExecuTorch works at all rather than what it says.
    */
   val LLM_SMOLLM2_135M_PTE = ModelSpec(
     id = "llm.smollm2_135m_executorch",
@@ -587,8 +592,14 @@ object ModelCatalog {
       ModelFile(
         fileName = "smollm2_135m.pte",
         source = ModelSource.HuggingFace(
+          // The repository publishes exactly one graph, under the generic name.
+          //
+          // sizeBytes stays 0 here and everywhere else without a checksum: CI measured
+          // 542,848,176 bytes, but a size the catalogue has not hashed is not allowed to
+          // become a gate, and the downloader takes the real length from Content-Length
+          // anyway. See CatalogTest.
           repoId = "executorch-community/SmolLM2-135M",
-          path = "smollm2_135m.pte",
+          path = "model.pte",
           hints = listOf("xnnpack", "8da4w", "q8"),
         ),
         sizeBytes = 0L,
@@ -603,8 +614,9 @@ object ModelCatalog {
         sizeBytes = 0L,
       ),
     ),
-    notes = "135M parameters — small enough to prove the ExecuTorch path works in under a " +
-      "minute, and far too small to be useful for anything else.",
+    notes = "135M parameters, but exported as float, so still a 518 MiB download. Quick to " +
+      "run rather than quick to fetch, and far too small to be useful for anything but " +
+      "checking the backend works.",
   )
 
 
@@ -666,7 +678,7 @@ object ModelCatalog {
         sizeBytes = 0L,
       )
     ),
-    notes = "Around 400 MiB and ungated. Small enough to be the first thing to try on the " +
+    notes = "469 MiB and ungated. Small enough to be the first thing to try on the " +
       "llama.cpp backend, and small enough that its answers show it.",
   )
 
