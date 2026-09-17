@@ -556,6 +556,24 @@ class AppViewModel(private val app: NeuroForgeApp) : ViewModel() {
     val staged = _state.value.pending
     if ((text.isBlank() && staged.isEmpty()) || _state.value.replying) return
 
+    // Refuse a photo the chosen model cannot see *before* loading it. The engine checks
+    // this too, but only once it is open — and opening one is a gigabyte and a minute, so
+    // finding out afterwards is the difference between a sentence and a wasted wait. The
+    // attachment is left staged so the photo can simply be removed.
+    if (chat.kind == ChatKind.TEXT && staged.any { it.kind == AttachmentKind.IMAGE }) {
+      val spec = ModelCatalog.byId(chat.modelId)
+      if (spec?.vision != true) {
+        _state.update {
+          it.copy(
+            error = "${spec?.displayName ?: chat.modelId} has no vision tower, so it " +
+              "cannot be shown a photo. Start a chat with a model the Models tab marks " +
+              "as able to see, or remove the image.",
+          )
+        }
+        return
+      }
+    }
+
     appendMessage(
       chat.id,
       ChatMessage(
