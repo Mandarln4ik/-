@@ -14,8 +14,8 @@ android {
     // 31 is where Build.SOC_MODEL arrives, and it is the floor the LiteRT NPU samples use.
     minSdk = 31
     targetSdk = 36
-    versionCode = 7
-    versionName = "1.4.0"
+    versionCode = 8
+    versionName = "1.4.1"
 
     // The NPU accelerators ship arm64 only; shipping other ABIs would only grow the APK
     // with builds that can never reach the hardware this app exists for.
@@ -38,6 +38,24 @@ android {
   // APK unsigned rather than failing the build or silently substituting the debug key.
   val keystorePath: String? = System.getenv("KEYSTORE_PATH")?.takeIf { it.isNotBlank() }
   signingConfigs {
+    // The debug key is checked into the repository on purpose.
+    //
+    // Without this, AGP signs with ~/.android/debug.keystore, which it generates per
+    // machine — so every CI run produced an APK with a different signature, and Android
+    // refuses to upgrade an installed app whose signature does not match. The only way
+    // through was uninstalling, which deletes app storage, which is where the downloaded
+    // models live. Several gigabytes, gone, on every update.
+    //
+    // A debug keystore is not a secret: the password is the well-known "android" and the
+    // certificate asserts nothing. Committing it does not weaken anything — it only makes
+    // the signature the same on every machine, which is what makes updates install in
+    // place. A release key is a different matter and stays in KEYSTORE_BASE64.
+    getByName("debug") {
+      storeFile = file("debug.keystore")
+      storePassword = "android"
+      keyAlias = "androiddebugkey"
+      keyPassword = "android"
+    }
     if (keystorePath != null) {
       create("release") {
         storeFile = file(keystorePath)
